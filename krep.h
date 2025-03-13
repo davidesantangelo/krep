@@ -11,7 +11,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdlib.h>
+#include <stddef.h>
+
+int search_file(const char *filename, const char *pattern, size_t pattern_len, bool case_sensitive,
+               bool count_only, int thread_count);
+int search_string(const char *pattern, size_t pattern_len, const char *text, bool case_sensitive);
 
 /* Search algorithm function declarations */
 uint64_t boyer_moore_search(const char *text, size_t text_len,
@@ -37,9 +41,5 @@ uint64_t avx2_search(const char *text, size_t text_len,
                     const char *pattern, size_t pattern_len,
                     bool case_sensitive);
 #endif
-
-/* Helper function declaration */
-void prepare_bad_char_table(const char *pattern, size_t pattern_len,
-                           int *bad_char_table, bool case_sensitive);
 
 #endif /* KREP_H */
