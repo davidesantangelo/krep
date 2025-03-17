@@ -17,8 +17,8 @@ https://dev.to/daviducolo/introducing-krep-building-a-high-performance-string-se
   - Boyer-Moore-Horspool algorithm for general-purpose efficient pattern matching
   - Knuth-Morris-Pratt (KMP) algorithm optimized for short patterns
   - Rabin-Karp algorithm for longer pattern lengths
-  - SIMD acceleration on compatible hardware (SSE4.2, AVX2)
-  
+  - SIMD acceleration on compatible hardware (SSE4.2, AVX2, and ARM NEON)
+
 - **Maximum performance**
   - Memory-mapped file I/O for optimal throughput
   - Multi-threaded parallel search for large files
@@ -89,7 +89,7 @@ krep -s "Hello" "Hello world"
 
 - **Memory-mapped I/O**: Avoids costly read() system calls
 - **Optimized algorithms**: Uses multiple string-matching algorithms optimized for different scenarios
-- **SIMD acceleration**: Utilizes SSE4.2 or AVX2 when available
+- **SIMD acceleration**: Utilizes SSE4.2, AVX2, or ARM Neon when available
 - **Multi-threading**: Processes large files in parallel chunks
 - **Minimal allocations**: Reduces memory overhead and fragmentation
 
@@ -119,7 +119,7 @@ Performance compared to standard tools (searching a 1GB text file for a common p
 
 3. **Memory efficiency**: Uses memory-mapped I/O to leverage the operating system's page cache
 
-4. **Hardware acceleration**: Automatically detects and utilizes SSE4.2 and AVX2 instructions when available
+4. **Hardware acceleration**: Automatically detects and utilizes SSE4.2, AVX2 and ARM Neon instructions when available
 
 ## Testing
 

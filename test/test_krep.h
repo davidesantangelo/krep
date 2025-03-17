@@ -32,4 +32,10 @@ uint64_t avx2_search(const char *text, size_t text_len,
                    bool case_sensitive);
 #endif
 
+#ifdef __ARM_NEON
+uint64_t neon_search(const char *text, size_t text_len,
+                    const char *pattern, size_t pattern_len,
+                    bool case_sensitive);
+#endif
+
 #endif /* TEST_KREP_H */

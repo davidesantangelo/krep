@@ -37,6 +37,10 @@
 #include <immintrin.h>
 #endif
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 #include "krep.h"
 
 // Add at the top of the file after includes, outside of any function
@@ -137,7 +141,7 @@ uint64_t boyer_moore_search(const char *text, size_t text_len,
         size_t j = pattern_len - 1;
         bool match = true;
         size_t start_pos = i - (pattern_len - 1);
-        
+
         // Check for match
         while (j != (size_t)-1 && match) {
             char text_char = text[i - (pattern_len - 1 - j)];
@@ -149,14 +153,14 @@ uint64_t boyer_moore_search(const char *text, size_t text_len,
             match = (text_char == pattern_char);
             j--;
         }
-        
+
         if (match) {
             match_count++;
-            
+
             // For test cases, increment by 1 to catch overlapping patterns
             // For real-world usage with non-overlapping patterns:
             // i += pattern_len;
-            
+
             // Move just past this match
             i = start_pos + 1 + (pattern_len - 1);
         } else {
@@ -165,7 +169,7 @@ uint64_t boyer_moore_search(const char *text, size_t text_len,
             int skip = bad_char_table[bad_char];
             i += (skip > 0) ? skip : 1;
         }
-        
+
         // Manual prefetching for next iteration
         if (i + pattern_len < text_len) {
             __builtin_prefetch(&text[i + pattern_len], 0, 1);
@@ -187,16 +191,16 @@ uint64_t kmp_search(const char *text, size_t text_len,
     // Special case for single character patterns
     if (pattern_len == 1) {
         char p = case_sensitive ? pattern[0] : lower_table[(unsigned char)pattern[0]];
-        
+
         if (case_sensitive) {
             // For case-sensitive, we can use memchr for better performance
             const char *ptr = text;
             size_t remaining = text_len;
-            
+
             while (remaining > 0) {
                 ptr = memchr(ptr, p, remaining);
                 if (!ptr) break;
-                
+
                 match_count++;
                 ptr++;
                 remaining = text_len - (ptr - text);
@@ -258,16 +262,15 @@ uint64_t kmp_search(const char *text, size_t text_len,
 
         if (j == pattern_len) {
             match_count++;
-            
+
             // For test cases with overlapping patterns
-            j = prefix_table[j - 1]; 
-            
+            j = prefix_table[j - 1];
+
             // For non-overlapping patterns in real code:
             // j = 0;
             // i = i - pattern_len + 1 + pattern_len;
         }
     }
-    
     free(prefix_table);
     return match_count;
 }
@@ -302,12 +305,11 @@ uint64_t rabin_karp_search(const char *text, size_t text_len,
             for (size_t j = 0; j < pattern_len; j++) {
                 char tc = text[i + j];
                 char pc = pattern[j];
-                
+
                 if (!case_sensitive) {
                     tc = lower_table[(unsigned char)tc];
                     pc = lower_table[(unsigned char)pc];
                 }
-                
                 if (tc != pc) {
                     match = false;
                     break;
@@ -328,7 +330,7 @@ uint64_t rabin_karp_search(const char *text, size_t text_len,
     // Use a smaller base and prime for better stability in tests
     const uint32_t base = 256;
     const uint32_t prime = 1000003; // Large enough prime
-    
+
     // Calculate the multiplier for the leading digit
     uint32_t h = 1;
     for (size_t i = 0; i < pattern_len - 1; i++) {
@@ -339,12 +341,12 @@ uint64_t rabin_karp_search(const char *text, size_t text_len,
     for (size_t i = 0; i < pattern_len; i++) {
         char pc = pattern[i];
         char tc = text[i];
-        
+
         if (!case_sensitive) {
             pc = lower_table[(unsigned char)pc];
             tc = lower_table[(unsigned char)tc];
         }
-        
+
         pattern_hash = (pattern_hash * base + pc) % prime;
         text_hash = (text_hash * base + tc) % prime;
     }
@@ -358,42 +360,42 @@ uint64_t rabin_karp_search(const char *text, size_t text_len,
             for (size_t j = 0; j < pattern_len; j++) {
                 char pc = pattern[j];
                 char tc = text[i + j];
-                
+
                 if (!case_sensitive) {
                     pc = lower_table[(unsigned char)pc];
                     tc = lower_table[(unsigned char)tc];
                 }
-                
+
                 if (pc != tc) {
                     found = false;
                     break;
                 }
             }
-            
+
             if (found) {
                 match_count++;
                 // For overlapping patterns, we just continue to next position
             }
         }
-        
+
         // Calculate hash value for next window: remove leading digit, add trailing digit
         if (i < text_len - pattern_len) {
             char leading = text[i];
             char trailing = text[i + pattern_len];
-            
+
             if (!case_sensitive) {
                 leading = lower_table[(unsigned char)leading];
                 trailing = lower_table[(unsigned char)trailing];
             }
-            
+
             // Remove contribution of leading character
             text_hash = (text_hash + prime - (h * leading % prime)) % prime;
-            
+
             // Multiply by base and add trailing character
             text_hash = (text_hash * base + trailing) % prime;
         }
     }
-    
+
     return match_count;
 }
 
@@ -416,10 +418,10 @@ uint64_t simd_search(const char *text, size_t text_len,
         for (size_t i = 0; i < pattern_len; i++) {
             lower_pattern[i] = lower_table[(unsigned char)pattern[i]];
         }
-        
+
         // Load the lowercase pattern
         __m128i lp = _mm_loadu_si128((__m128i*)lower_pattern);
-        
+
         // Optimized lowercase conversion with SIMD
         char lower_text[16];
         size_t i = 0;
@@ -440,7 +442,7 @@ uint64_t simd_search(const char *text, size_t text_len,
                         lowercase_mask
                     )
                 );
-                
+
                 // FIX: Correct return value check for _mm_cmpestri
                 // Value of 0 means match at position 0 (first position)
                 int match_pos = _mm_cmpestri(lp, pattern_len, lt, 16, _SIDD_CMP_EQUAL_ORDERED);
@@ -474,7 +476,7 @@ uint64_t simd_search(const char *text, size_t text_len,
             // FIX: Only use SIMD if we have enough bytes available
             if (text_len - i >= 16) {
                 __m128i t = _mm_loadu_si128((__m128i*)(text + i));
-                
+
                 // FIX: Correct return value check for _mm_cmpestri
                 // Value of 0 means match at position 0 (first position)
                 int match_pos = _mm_cmpestri(p, pattern_len, t, 16, _SIDD_CMP_EQUAL_ORDERED);
@@ -523,23 +525,23 @@ uint64_t avx2_search(const char *text, size_t text_len,
     size_t i = 0;
     while (i <= text_len - pattern_len) {
         bool match = true;
-        
+
         // Use standard comparison for accurate non-overlapping matches
         for (size_t j = 0; j < pattern_len; j++) {
             char tc = text[i + j];
             char pc = pattern[j];
-            
+
             if (!case_sensitive) {
                 tc = lower_table[(unsigned char)tc];
                 pc = lower_table[(unsigned char)pc];
             }
-            
+
             if (tc != pc) {
                 match = false;
                 break;
             }
         }
-        
+
         if (match) {
             match_count++;
             i++;
@@ -547,7 +549,78 @@ uint64_t avx2_search(const char *text, size_t text_len,
             i++;
         }
     }
-    
+
+    return match_count;
+}
+#endif
+
+#ifdef __ARM_NEON
+/**
+ * NEON-accelerated search for ARM processors
+ */
+uint64_t neon_search(const char *text, size_t text_len,
+                    const char *pattern, size_t pattern_len,
+                    bool case_sensitive) {
+    uint64_t match_count = 0;
+
+    if (pattern_len <= 2 || pattern_len > 16 || text_len < pattern_len) {
+        return boyer_moore_search(text, text_len, pattern, pattern_len, case_sensitive);
+    }
+
+    // Precompute lowercase pattern if needed
+    char lower_pattern[16] = {0};
+    for (size_t i = 0; i < pattern_len; i++) {
+        lower_pattern[i] = case_sensitive ? pattern[i] : lower_table[(unsigned char)pattern[i]];
+    }
+
+    uint8x16_t pattern_vec = vld1q_u8((const uint8_t*)lower_pattern);
+    size_t i = 0;
+
+    while (i <= text_len - 32 - pattern_len + 1) { // Adjusted loop condition
+        __builtin_prefetch(&text[i + 64], 0, 1); // Prefetch next chunk
+
+        // Load two 16-byte blocks
+        uint8x16x2_t text_vec = vld1q_u8_x2((const uint8_t *)(text + i));
+
+        if (!case_sensitive) {
+            // Fast case conversion using lookup table
+            text_vec.val[0] = vqtbl1q_u8(vld1q_u8((const uint8_t *)lower_table), text_vec.val[0]);
+            text_vec.val[1] = vqtbl1q_u8(vld1q_u8((const uint8_t *)lower_table), text_vec.val[1]);
+        }
+
+        // Compare both 16-byte blocks
+        uint8x16_t cmp_result1 = vceqq_u8(pattern_vec, text_vec.val[0]);
+        uint8x16_t cmp_result2 = vceqq_u8(pattern_vec, text_vec.val[1]);
+
+        uint64x2_t mask1 = vreinterpretq_u64_u8(cmp_result1);
+        uint64x2_t mask2 = vreinterpretq_u64_u8(cmp_result2);
+
+        uint64_t result1 = vgetq_lane_u64(mask1, 0);
+        uint64_t result2 = vgetq_lane_u64(mask2, 0);
+
+        uint64_t pattern_mask = (1ULL << (pattern_len * 8)) - 1;
+
+        if ((result1 & pattern_mask) == pattern_mask) match_count++;
+        if ((result2 & pattern_mask) == pattern_mask) match_count++;
+
+        i += 32; // Move forward by 32 bytes
+    }
+
+    // Process remaining bytes with scalar fallback
+    while (i <= text_len - pattern_len) {
+        bool match = true;
+        for (size_t j = 0; j < pattern_len; j++) {
+            char tc = case_sensitive ? text[i + j] : lower_pattern[j]; // Use lower_pattern directly
+            char pc = lower_pattern[j];
+            if (tc != pc) {
+                match = false;
+                break;
+            }
+        }
+        if (match) match_count++;
+        i++;
+    }
+
     return match_count;
 }
 #endif
@@ -566,10 +639,10 @@ void* search_thread(void *arg) {
     } else {
         return NULL;
     }
-    
+
     // Special handling for the first thread (no adjustment needed)
     size_t start_pos = job->start_pos;
-    
+
     // Skip potentially overlapping matches at thread boundaries (except first thread)
     if (job->thread_id > 0) {
         // Find the first position that won't create overlaps with previous thread
@@ -580,18 +653,18 @@ void* search_thread(void *arg) {
             for (size_t j = 0; j < job->pattern_len && (start_pos + i + j) < effective_end; j++) {
                 char text_char = job->file_data[start_pos + i + j];
                 char pattern_char = job->pattern[j];
-                
+
                 if (!job->case_sensitive) {
                     text_char = lower_table[(unsigned char)text_char];
                     pattern_char = lower_table[(unsigned char)pattern_char];
                 }
-                
+
                 if (text_char != pattern_char) {
                     potential_match = false;
                     break;
                 }
             }
-            
+
             if (potential_match) {
                 // Found a match at the boundary, skip ahead
                 start_pos += (i + job->pattern_len);
@@ -599,7 +672,7 @@ void* search_thread(void *arg) {
             }
         }
     }
-    
+
     // If boundaries overlap completely, nothing to do
     if (start_pos >= effective_end) {
         return NULL;
@@ -624,6 +697,11 @@ void* search_thread(void *arg) {
                                      job->case_sensitive);
 #elif defined(__SSE4_2__)
         job->local_count = simd_search(job->file_data + start_pos,
+                                     effective_end - start_pos,
+                                     job->pattern, job->pattern_len,
+                                     job->case_sensitive);
+#elif defined(__ARM_NEON)
+        job->local_count = neon_search(job->file_data + start_pos,
                                      effective_end - start_pos,
                                      job->pattern, job->pattern_len,
                                      job->case_sensitive);
@@ -659,6 +737,8 @@ int search_string(const char *pattern, size_t pattern_len, const char *text, boo
         match_count = avx2_search(text, text_len, pattern, pattern_len, case_sensitive);
 #elif defined(__SSE4_2__)
         match_count = simd_search(text, text_len, pattern, pattern_len, case_sensitive);
+#elif defined(__ARM_NEON)
+        match_count = neon_search(text, text_len, pattern, pattern_len, case_sensitive);
 #else
         match_count = boyer_moore_search(text, text_len, pattern, pattern_len, case_sensitive);
 #endif
@@ -676,6 +756,8 @@ int search_string(const char *pattern, size_t pattern_len, const char *text, boo
     printf("  - Using AVX2 acceleration\n");
 #elif defined(__SSE4_2__)
     printf("  - Using SSE4.2 acceleration\n");
+#elif defined(__ARM_NEON)
+    printf("  - Using ARM Neon acceleration\n");
 #else
     printf("  - Using Boyer-Moore-Horspool algorithm\n");
 #endif
@@ -739,12 +821,12 @@ int search_file(const char *filename, const char *pattern, size_t pattern_len, b
     // Adaptive threading threshold with better limits
     int cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cpu_cores <= 0) cpu_cores = 1;
-    
-    thread_count = (thread_count <= 0) ? 1 : 
+
+    thread_count = (thread_count <= 0) ? 1 :
                    (thread_count > cpu_cores) ? cpu_cores : thread_count;
-                   
+
     // Adjust threshold based on pattern length - longer patterns need more data per thread
-    size_t dynamic_threshold = MIN_FILE_SIZE_FOR_THREADS * cpu_cores * 
+    size_t dynamic_threshold = MIN_FILE_SIZE_FOR_THREADS * cpu_cores *
                               (1 + (pattern_len > 64 ? 64 : pattern_len) / 16);
 
     // Use single-threaded approach for small files or when specifically requested
@@ -758,6 +840,8 @@ int search_file(const char *filename, const char *pattern, size_t pattern_len, b
             match_count = avx2_search(file_data, file_size, pattern, pattern_len, case_sensitive);
 #elif defined(__SSE4_2__)
             match_count = simd_search(file_data, file_size, pattern, pattern_len, case_sensitive);
+#elif defined(__ARM_NEON)
+            match_count = neon_search(file_data, file_size, pattern, pattern_len, case_sensitive);
 #else
             match_count = boyer_moore_search(file_data, file_size, pattern, pattern_len, case_sensitive);
 #endif
@@ -786,19 +870,19 @@ int search_file(const char *filename, const char *pattern, size_t pattern_len, b
         for (int i = 0; i < thread_count; i++) {
             jobs[i].file_data = file_data;
             jobs[i].start_pos = i * chunk_size;
-            
+
             // Handle the last chunk boundary
             if (i == thread_count - 1) {
                 jobs[i].end_pos = file_size;
             } else {
                 jobs[i].end_pos = (i + 1) * chunk_size;
-                
+
                 // Add overlap to ensure we don't miss matches at chunk boundaries
                 if (jobs[i].end_pos + pattern_len - 1 <= file_size) {
                     jobs[i].end_pos += pattern_len - 1;
                 }
             }
-            
+
             jobs[i].pattern = pattern;
             jobs[i].pattern_len = pattern_len;
             jobs[i].case_sensitive = case_sensitive;
@@ -843,6 +927,8 @@ int search_file(const char *filename, const char *pattern, size_t pattern_len, b
         printf("  - Using AVX2 acceleration\n");
 #elif defined(__SSE4_2__)
         printf("  - Using SSE4.2 acceleration\n");
+#elif defined(__ARM_NEON)
+        printf("  - Using ARM NEON acceleration\n");
 #else
         printf("  - Using Boyer-Moore-Horspool algorithm\n");
 #endif
@@ -911,7 +997,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Empty pattern\n");
         return 1;
     }
-    
+
     if (strlen(pattern) > MAX_PATTERN_LENGTH) {
         fprintf(stderr, "Error: Pattern too long (max %d characters)\n", MAX_PATTERN_LENGTH);
         return 1;
@@ -927,7 +1013,7 @@ int main(int argc, char *argv[]) {
     // Clean up any stray quotes or commas in the pattern
     char *p = clean_pattern;
     char *q = clean_pattern; // Destination pointer
-    
+
     while (*p) {
         if (*p != '\'' && *p != '"' && *p != ',') {
             *q++ = *p;
@@ -935,10 +1021,10 @@ int main(int argc, char *argv[]) {
         p++;
     }
     *q = '\0'; // Ensure null termination
-    
+
     // Get the clean pattern length - keep this line
     size_t clean_pattern_len = strlen(clean_pattern);
-    
+
     if (string_mode) {
         if (optind >= argc) {
             fprintf(stderr, "Error: Missing string to search within\n");
