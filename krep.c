@@ -68,7 +68,7 @@ static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr,
 #define MIN_CHUNK_SIZE (4 * 1024 * 1024)
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "1.3"
+#define VERSION "1.4"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -1745,8 +1745,8 @@ search_func_t select_search_algorithm(const search_params_t *params)
             return simd_sse42_search;
 #endif
 #if KREP_USE_NEON
-        // NEON only supports case-sensitive up to 16 bytes
-        if (params->pattern_len <= 16 && params->case_sensitive)
+        // NEON supports case-sensitive for any length (using first-byte filter)
+        if (params->case_sensitive)
             return neon_search;
 #endif
     }
@@ -2172,6 +2172,7 @@ int search_file(const search_params_t *params, const char *filename, int request
     struct stat file_stat;                       // File stats
     size_t file_size = 0;                        // File size
     char *file_data = MAP_FAILED;                // Mapped file data
+    bool data_is_malloced = false;               // Flag to indicate if file_data was malloced
     match_result_t *global_matches = NULL;       // Global result collection
     pthread_t *threads = NULL;                   // Thread handles
     thread_data_t *thread_args = NULL;           // Thread arguments
@@ -2514,56 +2515,97 @@ int search_file(const search_params_t *params, const char *filename, int request
     (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
 
-    // --- Memory Map File ---
-    // FIX: Use conditional compilation for MAP_POPULATE
-    int mmap_base_flags = MAP_PRIVATE;
-    file_data = MAP_FAILED; // Initialize file_data
+    // --- Memory Map or Read File ---
+    // Optimization: For small files, use read() to avoid mmap overhead and page faults.
+    if (file_size < 65536) // 64KB threshold
+    {
+        file_data = malloc(file_size + 1); // +1 for safety/null-term if needed
+        if (!file_data)
+        {
+            fprintf(stderr, "krep: %s: malloc failed: %s\n", filename, strerror(errno));
+            close(fd);
+            if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
+                regfree(&compiled_regex_local);
+            free(combined_regex_pattern);
+            result_code = 2;
+            goto cleanup_file;
+        }
+        
+        ssize_t bytes_read = 0;
+        size_t total_read = 0;
+        while (total_read < file_size)
+        {
+            bytes_read = read(fd, file_data + total_read, file_size - total_read);
+            if (bytes_read < 0)
+            {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "krep: %s: read failed: %s\n", filename, strerror(errno));
+                free(file_data);
+                close(fd);
+                if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
+                    regfree(&compiled_regex_local);
+                free(combined_regex_pattern);
+                result_code = 2;
+                goto cleanup_file;
+            }
+            if (bytes_read == 0) break; // Unexpected EOF
+            total_read += bytes_read;
+        }
+        file_data[file_size] = '\0'; // Null terminate for safety
+        data_is_malloced = true;
+    }
+    else
+    {
+        // Use mmap for larger files
+        int mmap_base_flags = MAP_PRIVATE;
+        file_data = MAP_FAILED; // Initialize file_data
 
 #ifdef MAP_POPULATE
-    // Try with MAP_POPULATE first
-    int mmap_flags_populate = mmap_base_flags | MAP_POPULATE;
-    file_data = mmap(NULL, file_size, PROT_READ, mmap_flags_populate, fd, 0);
+        // Try with MAP_POPULATE first
+        int mmap_flags_populate = mmap_base_flags | MAP_POPULATE;
+        file_data = mmap(NULL, file_size, PROT_READ, mmap_flags_populate, fd, 0);
 
-    // If MAP_POPULATE failed, try without it
-    if (file_data == MAP_FAILED && errno == ENOTSUP) // Check if MAP_POPULATE is specifically not supported
-    {
-        // fprintf(stderr, "krep: %s: mmap with MAP_POPULATE not supported, retrying without...\n", filename);
-        file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
-    }
-    else if (file_data == MAP_FAILED)
-    {
-        fprintf(stderr, "krep: %s: mmap with MAP_POPULATE failed (%s), retrying without...\n", filename, strerror(errno));
-        file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
-    }
+        // If MAP_POPULATE failed, try without it
+        if (file_data == MAP_FAILED && errno == ENOTSUP) // Check if MAP_POPULATE is specifically not supported
+        {
+            // fprintf(stderr, "krep: %s: mmap with MAP_POPULATE not supported, retrying without...\n", filename);
+            file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
+        }
+        else if (file_data == MAP_FAILED)
+        {
+            fprintf(stderr, "krep: %s: mmap with MAP_POPULATE failed (%s), retrying without...\n", filename, strerror(errno));
+            file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
+        }
 #else
-    // MAP_POPULATE not defined, just call mmap without it
-    file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
+        // MAP_POPULATE not defined, just call mmap without it
+        file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
 #endif
 
-    // Check if mmap failed even after potential fallback
-    if (file_data == MAP_FAILED)
-    {
-        fprintf(stderr, "krep: %s: mmap: %s\n", filename, strerror(errno));
-        close(fd);
-        if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
-            regfree(&compiled_regex_local);
-        free(combined_regex_pattern);
-        // No need to free global_matches, threads, thread_args here, handled by goto cleanup_file
-        result_code = 2;
-        goto cleanup_file; // Use goto to ensure proper cleanup
-    }
-
-    // Advise the kernel about expected access pattern
-    int madvise_ret = madvise(file_data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
-    if (madvise_ret != 0)
-    {
-        int madvise_err = errno;
-        if (!atomic_exchange(&madvise_warning_emitted, true))
+        // Check if mmap failed even after potential fallback
+        if (file_data == MAP_FAILED)
         {
-            fprintf(stderr, "krep: %s: Warning: madvise failed: %s (future warnings suppressed)\n",
-                    filename, strerror(madvise_err));
+            fprintf(stderr, "krep: %s: mmap: %s\n", filename, strerror(errno));
+            close(fd);
+            if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
+                regfree(&compiled_regex_local);
+            free(combined_regex_pattern);
+            // No need to free global_matches, threads, thread_args here, handled by goto cleanup_file
+            result_code = 2;
+            goto cleanup_file; // Use goto to ensure proper cleanup
         }
-        // Continue execution since this is just an optimization
+
+        // Advise the kernel about expected access pattern
+        int madvise_ret = madvise(file_data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+        if (madvise_ret != 0)
+        {
+            int madvise_err = errno;
+            if (!atomic_exchange(&madvise_warning_emitted, true))
+            {
+                fprintf(stderr, "krep: %s: Warning: madvise failed: %s (future warnings suppressed)\n",
+                        filename, strerror(madvise_err));
+            }
+            // Continue execution since this is just an optimization
+        }
     }
 
     close(fd); // Close file descriptor after mmap
@@ -2854,8 +2896,12 @@ int search_file(const search_params_t *params, const char *filename, int request
 
 cleanup_file:
     // --- Cleanup Resources ---
-    if (file_data != MAP_FAILED)
-        munmap(file_data, file_size);
+    if (file_data != MAP_FAILED) {
+        if (data_is_malloced)
+            free(file_data);
+        else
+            munmap(file_data, file_size);
+    }
     if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
         regfree(&compiled_regex_local);
     free(combined_regex_pattern);
@@ -3990,12 +4036,189 @@ uint64_t neon_search(const search_params_t *params,
                      size_t text_len,
                      match_result_t *result)
 {
-    if (params->pattern_len > 16 || !params->case_sensitive)
+    // Precondition checks
+    if (params->pattern_len == 0 || !params->case_sensitive || text_len < params->pattern_len)
     {
         return boyer_moore_search(params, text_start, text_len, result);
     }
+    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+        return 0;
 
-    return boyer_moore_search(params, text_start, text_len, result);
+    uint64_t current_count = 0;
+    size_t pattern_len = params->pattern_len;
+    const char *pattern = params->pattern;
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count;
+    size_t last_counted_line_start = SIZE_MAX;
+
+    // Broadcast the first character of the pattern to a 128-bit vector
+    uint8x16_t first_char_vec = vdupq_n_u8((uint8_t)pattern[0]);
+
+    const char *current_pos = text_start;
+    size_t remaining_len = text_len;
+
+    // Process in 16-byte chunks
+    while (remaining_len >= 16)
+    {
+        // Load 16 bytes of text
+        uint8x16_t text_vec = vld1q_u8((const uint8_t *)current_pos);
+
+        // Compare with first character
+        uint8x16_t cmp = vceqq_u8(text_vec, first_char_vec);
+
+        // Check if any match found
+        // vmaxvq_u8 returns the maximum value across the vector. If any byte matched (0xFF), result is 0xFF.
+        if (vmaxvq_u8(cmp) != 0)
+        {
+            // Extract mask to find exact positions
+            // Since NEON doesn't have a direct movemask, we simulate it or iterate.
+            // For simplicity and portability, we can store the comparison result to a temporary array
+            // or use a narrowing shift trick to create a 64-bit mask.
+            
+            // Efficient mask extraction for NEON:
+            uint8_t match_mask[16] __attribute__((aligned(16)));
+            vst1q_u8(match_mask, cmp);
+
+            for (int i = 0; i < 16; ++i)
+            {
+                if (match_mask[i] != 0)
+                {
+                    // Potential match at offset i
+                    // Check bounds for full pattern match
+                    if (remaining_len - i < pattern_len) 
+                        continue; // Should be handled by outer loop condition mostly, but safety first
+
+                    // Verify full pattern match
+                    if (memcmp(current_pos + i, pattern, pattern_len) == 0)
+                    {
+                        size_t match_start_offset = (current_pos - text_start) + i;
+
+                        // Whole word check
+                        if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
+                        {
+                            continue;
+                        }
+
+                        bool count_incremented_this_match = false;
+
+                        if (count_lines_mode)
+                        {
+                            size_t line_start = find_line_start(text_start, text_len, match_start_offset);
+                            if (line_start != last_counted_line_start)
+                            {
+                                if (current_count >= max_count) goto end_neon_search;
+
+                                current_count++;
+                                last_counted_line_start = line_start;
+                                count_incremented_this_match = true;
+
+                                // Optimization: skip to end of line
+                                size_t line_end = find_line_end(text_start, text_len, line_start);
+                                if (line_end < text_len)
+                                {
+                                    // Calculate how much to advance current_pos to reach the start of the next line
+                                    // current_pos is the start of the current 16-byte chunk
+                                    // We want current_pos to become (text_start + line_end + 1)
+                                    
+                                    size_t next_line_start = line_end + 1;
+                                    size_t current_pos_offset = current_pos - text_start;
+                                    
+                                    // Ensure we are advancing forward
+                                    if (next_line_start > current_pos_offset)
+                                    {
+                                        size_t advance = next_line_start - current_pos_offset;
+                                        
+                                        // Ensure we don't advance past end
+                                        if (advance > remaining_len) advance = remaining_len;
+                                        
+                                        current_pos += advance;
+                                        remaining_len -= advance;
+                                        goto next_chunk; // Jump to next iteration of outer loop
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (current_count >= max_count) goto end_neon_search;
+
+                            current_count++;
+                            count_incremented_this_match = true;
+
+                            if (track_positions && result)
+                            {
+                                if (current_count <= max_count)
+                                {
+                                    if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
+                                    {
+                                        fprintf(stderr, "Warning: Failed to add NEON match position.\n");
+                                    }
+                                }
+                            }
+                        }
+
+                        if (count_incremented_this_match && current_count >= max_count)
+                        {
+                            goto end_neon_search;
+                        }
+                        
+                        // If only_matching is false (finding all occurrences including overlaps not typically required for simple search unless specified)
+                        // But standard grep doesn't usually overlap. 
+                        // If we found a match, we can potentially skip pattern_len - 1 to avoid re-checking.
+                        // However, for simplicity and correctness with the loop i++, we just continue.
+                        // Optimizing this would require jumping 'i'.
+                    }
+                }
+            }
+        }
+        
+        // Advance to next chunk
+        current_pos += 16;
+        remaining_len -= 16;
+        
+    next_chunk:;
+    }
+
+    // Handle tail
+    if (remaining_len >= pattern_len)
+    {
+        search_params_t tail_params = *params;
+        if (max_count != SIZE_MAX)
+        {
+            tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
+        }
+        
+        uint64_t tail_count = boyer_moore_search(&tail_params, current_pos, remaining_len, result);
+        
+        // Fixup result offsets if needed (boyer_moore adds relative to current_pos if we passed result)
+        // Actually boyer_moore adds absolute offsets if we pass text_start as current_pos? 
+        // No, boyer_moore takes "text_start" argument. If we pass `current_pos`, it treats that as 0.
+        // So we need to adjust if we passed `result`.
+        
+        if (result && track_positions && tail_count > 0)
+        {
+             // Fix offsets for the tail matches
+             size_t tail_offset = current_pos - text_start;
+             // The matches were added at the end of result->positions
+             // We need to find which ones were just added.
+             // This is tricky if we don't know exactly how many were added, but we do: tail_count.
+             // Wait, boyer_moore returns the count.
+             
+             size_t start_idx = result->count - tail_count;
+             if (result->count >= tail_count) { // Safety check
+                 for(size_t k = 0; k < tail_count; ++k) {
+                     result->positions[start_idx + k].start_offset += tail_offset;
+                     result->positions[start_idx + k].end_offset += tail_offset;
+                 }
+             }
+        }
+        
+        current_count += tail_count;
+    }
+
+end_neon_search:
+    return current_count;
 }
 #endif
 

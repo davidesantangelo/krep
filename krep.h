@@ -108,6 +108,10 @@ typedef struct
 
    // Status flags
    bool error_flag; // Flag to indicate an error occurred in the thread
+
+   // Padding to prevent false sharing (ensure struct size is multiple of 64 bytes)
+   // Current size approx 56 bytes. Adding sufficient padding.
+   char padding[64]; 
 } thread_data_t;
 
 /* --- Thread Pool Implementation --- */

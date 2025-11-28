@@ -1,13 +1,13 @@
 # K(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-1.2-blue)
+![Version](https://img.shields.io/badge/version-1.4-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
 
 > **Note:**  
-> Krep is not intended to be a full replacement or direct competitor to feature-rich tools like `grep` or `ripgrep`. Instead, it aims to be a minimal, efficient, and pragmatic tool focused on speed and simplicity.  
->  
+> Krep is not intended to be a full replacement or direct competitor to feature-rich tools like `grep` or `ripgrep`. Instead, it aims to be a minimal, efficient, and pragmatic tool focused on speed and simplicity.
+>
 > Krep provides the essential features needed for fast searching, without the extensive options and complexity of more comprehensive search utilities. Its design philosophy is to deliver the fastest possible search for the most common use cases, with a clean and minimal interface.
 
 ## The Story Behind the Name
@@ -85,21 +85,25 @@ cat FILE | krep [OPTIONS] PATTERN
 ## Usage Examples
 
 Search for a fixed string in a file:
+
 ```bash
 krep -F "value: 100%" config.ini
 ```
 
 Search recursively:
+
 ```bash
 krep -r "function" ./project
 ```
 
 Whole word search (matches only complete words):
+
 ```bash
 krep -w 'cat' samples/text.en
 ```
 
 Use with piped input:
+
 ```bash
 cat krep.c | krep 'c'
 ```
@@ -128,14 +132,15 @@ cat krep.c | krep 'c'
 Comparing performance on the same text file with identical search pattern:
 
 | Tool    | Time (seconds) | CPU Usage |
-|---------|---------------:|----------:|
-| krep    |         0.106  |     328%  |
-| grep    |         4.400  |      99%  |
-| ripgrep |         0.115  |      97%  |
+| ------- | -------------: | --------: |
+| krep    |          0.106 |      328% |
+| grep    |          4.400 |       99% |
+| ripgrep |          0.115 |       97% |
 
-*Krep is approximately 41.5x faster than grep and slightly faster than ripgrep in this test. Benchmarks performed on Mac Mini M4 with 24GB RAM.*
+_Krep is approximately 41.5x faster than grep and slightly faster than ripgrep in this test. Benchmarks performed on Mac Mini M4 with 24GB RAM._
 
 The benchmarks above were conducted using the subtitles2016-sample.en.gz dataset, which can be obtained with:
+
 ```bash
 curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
 ```
@@ -183,6 +188,7 @@ Instead of traditional read operations:
 ### 5. Skipping Non-Relevant Content
 
 When using recursive search (`-r`), Krep automatically:
+
 - Skips common binary file types
 - Ignores version control directories (`.git`, `.svn`)
 - Bypasses dependency directories (`node_modules`, `venv`)
