@@ -3981,8 +3981,8 @@ uint64_t memchr_short_search(const search_params_t *params,
             // Whole word check
             if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
             {
-                current_pos = potential_match + 1;
                 remaining_len -= (potential_match - current_pos) + 1;
+                current_pos = potential_match + 1;
                 continue;
             }
 
