@@ -3484,6 +3484,10 @@ int main(int argc, char *argv[])
     }
     else
     { // Single target (file or stdin)
+        // If target_arg is NULL, it means stdin - set to "-" for consistency
+        if (target_arg == NULL)
+            target_arg = "-";
+
         // search_file handles stdin internally if target_arg is "-"
         struct stat target_stat;
         // If not stdin, check if it's a directory without -r
