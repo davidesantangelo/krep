@@ -2517,7 +2517,9 @@ int search_file(const search_params_t *params, const char *filename, int request
 
     // --- Memory Map or Read File ---
     // Optimization: For small files, use read() to avoid mmap overhead and page faults.
-    if (file_size < 65536) // 64KB threshold
+    // For regex searches, always use malloc+read to ensure null-termination,
+    // because regexec with REG_STARTEND may read beyond the specified rm_eo boundary.
+    if (file_size < 65536 || current_params.use_regex) // 64KB threshold or regex mode
     {
         file_data = malloc(file_size + 1); // +1 for safety/null-term if needed
         if (!file_data)
