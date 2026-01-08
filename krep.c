@@ -1217,63 +1217,10 @@ void prepare_bad_char_table(const unsigned char *pattern, size_t pattern_len, in
     }
 }
 
-// Prepare good suffix table for Boyer-Moore (turbo shift enhancement)
-static void prepare_good_suffix_table(const unsigned char *pattern, size_t pattern_len, 
-                                       int *good_suffix_table, int *suffix_table)
-{
-    size_t m = pattern_len;
-    
-    // Compute suffix table
-    suffix_table[m - 1] = m;
-    int g = m - 1;
-    int f = 0;
-    
-    for (int i = (int)m - 2; i >= 0; --i)
-    {
-        if (i > g && suffix_table[i + m - 1 - f] < i - g)
-        {
-            suffix_table[i] = suffix_table[i + m - 1 - f];
-        }
-        else
-        {
-            if (i < g)
-                g = i;
-            f = i;
-            while (g >= 0 && pattern[g] == pattern[g + m - 1 - f])
-                --g;
-            suffix_table[i] = f - g;
-        }
-    }
-    
-    // Compute good suffix shifts
-    for (size_t i = 0; i < m; i++)
-    {
-        good_suffix_table[i] = m;
-    }
-    
-    int j = 0;
-    for (int i = (int)m - 1; i >= 0; --i)
-    {
-        if (suffix_table[i] == i + 1)
-        {
-            for (; j < (int)m - 1 - i; ++j)
-            {
-                if (good_suffix_table[j] == (int)m)
-                {
-                    good_suffix_table[j] = (int)m - 1 - i;
-                }
-            }
-        }
-    }
-    
-    for (size_t i = 0; i <= m - 2; i++)
-    {
-        good_suffix_table[m - 1 - suffix_table[i]] = (int)m - 1 - i;
-    }
-}
+
 
 // Adds positions to 'result' if params->track_positions is true.
-// Enhanced with turbo shift and prefetching for maximum performance
+// Enhanced with prefetching for better cache performance
 HOT_FUNCTION
 uint64_t boyer_moore_search(const search_params_t *params,
                             const char *text_start,
@@ -1299,30 +1246,6 @@ uint64_t boyer_moore_search(const search_params_t *params,
     // Prepare bad character table
     int bad_char_table[256];
     prepare_bad_char_table(search_pattern, pattern_len, bad_char_table, case_sensitive);
-    
-    // Prepare good suffix table for turbo shift (only for longer patterns)
-    int *good_suffix_table = NULL;
-    int *suffix_table = NULL;
-    bool use_turbo = (pattern_len >= 4 && pattern_len <= 256);
-    
-    if (use_turbo)
-    {
-        good_suffix_table = malloc(pattern_len * sizeof(int));
-        suffix_table = malloc(pattern_len * sizeof(int));
-        if (good_suffix_table && suffix_table)
-        {
-            prepare_good_suffix_table(search_pattern, pattern_len, good_suffix_table, suffix_table);
-        }
-        else
-        {
-            // Fallback if allocation fails
-            use_turbo = false;
-            free(good_suffix_table);
-            free(suffix_table);
-            good_suffix_table = NULL;
-            suffix_table = NULL;
-        }
-    }
 
     uint64_t current_count = 0;
     size_t last_counted_line_start = SIZE_MAX;
@@ -1332,10 +1255,6 @@ uint64_t boyer_moore_search(const search_params_t *params,
     // Hoist pattern's last char once
     unsigned char pc_last = search_pattern[pattern_len - 1];
     unsigned char pc_last_lower = case_sensitive ? pc_last : lower_table[pc_last];
-
-    // Turbo shift variables
-    size_t turbo_shift = 0;
-    size_t turbo_len = 0;
 
     while (i < search_limit)
     {
@@ -1351,22 +1270,11 @@ uint64_t boyer_moore_search(const search_params_t *params,
         if (last_char_match)
         {
             bool full_match = true;
-            size_t j = pattern_len - 1;
-            
-            // Compare from right to left
             if (pattern_len > 1)
             {
                 if (case_sensitive)
                 {
-                    // Optimized comparison with early exit
-                    for (j = pattern_len - 1; j > 0; --j)
-                    {
-                        if (utext_start[i + j - 1] != search_pattern[j - 1])
-                        {
-                            full_match = false;
-                            break;
-                        }
-                    }
+                    full_match = (memcmp(utext_start + i, search_pattern, pattern_len - 1) == 0);
                 }
                 else
                 {
@@ -1382,10 +1290,8 @@ uint64_t boyer_moore_search(const search_params_t *params,
                     unsigned char bad = tc_last;
                     int shift_val = bad_char_table[bad];
                     i += shift_val;
-                    turbo_shift = 0;
                     continue;
                 }
-                
                 bool count_incremented_this_match = false;
                 if (count_lines_mode)
                 {
@@ -1413,59 +1319,20 @@ uint64_t boyer_moore_search(const search_params_t *params,
                 if (count_incremented_this_match && current_count >= max_count)
                     break;
 
-                // After match: advance by pattern length (non-overlapping matches)
+                unsigned char bad = tc_last;
+                int shift_val = bad_char_table[bad];
                 if (only_matching && !params->count_lines_mode)
                     i += pattern_len;
                 else
-                {
-                    int shift_val = bad_char_table[tc_last];
-                    i += (shift_val > 1) ? shift_val : 1;
-                }
-                turbo_shift = 0;
-                turbo_len = 0;
-                continue;
-            }
-            else
-            {
-                // Mismatch occurred - compute shift using both heuristics
-                int bc_shift = bad_char_table[tc_last];
-                int gs_shift = 1;
-                
-                if (use_turbo && good_suffix_table)
-                {
-                    gs_shift = good_suffix_table[j];
-                    
-                    // Turbo-BM optimization
-                    if (turbo_len >= j && turbo_shift != (size_t)gs_shift)
-                    {
-                        size_t shift = (turbo_len > pattern_len - j) ? 
-                                        turbo_len - pattern_len + j + 1 : 1;
-                        if (shift > (size_t)gs_shift)
-                            gs_shift = shift;
-                    }
-                }
-                
-                int shift_val = (bc_shift > gs_shift) ? bc_shift : gs_shift;
-                
-                // Save turbo state
-                turbo_len = (bc_shift > gs_shift) ? 0 : pattern_len - j;
-                turbo_shift = shift_val;
-                
-                i += shift_val;
+                    i += shift_val;
                 continue;
             }
         }
 
-        // No last char match - use bad character shift
-        int shift_val = bad_char_table[tc_last];
-        turbo_shift = 0;
-        turbo_len = 0;
+        unsigned char bad = tc_last;
+        int shift_val = bad_char_table[bad];
         i += shift_val;
     }
-
-    // Cleanup
-    if (good_suffix_table) free(good_suffix_table);
-    if (suffix_table) free(suffix_table);
 
     return current_count;
 }
@@ -2029,7 +1896,7 @@ void *search_chunk_thread(void *arg)
 const char *get_algorithm_name(search_func_t func)
 {
     if (func == boyer_moore_search)
-        return "Boyer-Moore-Turbo";
+        return "Boyer-Moore-Horspool";
     else if (func == kmp_search)
         return "Knuth-Morris-Pratt";
     else if (func == regex_search)
