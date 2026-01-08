@@ -20,15 +20,20 @@ endif
 ARCH := $(shell uname -m)
 
 ifeq ($(ARCH), x86_64)
-    # Check for AVX-512 support
-    HAS_AVX512 := $(shell cat /proc/cpuinfo 2>/dev/null | grep -c avx512f || sysctl -a 2>/dev/null | grep -c AVX512F || echo 0)
+    # Check for AVX-512 support (Linux: /proc/cpuinfo, macOS: sysctl)
+    HAS_AVX512 := $(shell (grep -q avx512f /proc/cpuinfo 2>/dev/null && echo 1) || \
+                          (sysctl -n machdep.cpu.features 2>/dev/null | grep -q AVX512F && echo 1) || \
+                          echo 0)
     # Check for AVX2 support
-    HAS_AVX2 := $(shell cat /proc/cpuinfo 2>/dev/null | grep -c avx2 || sysctl -a 2>/dev/null | grep -c AVX2 || echo 0)
+    HAS_AVX2 := $(shell (grep -q avx2 /proc/cpuinfo 2>/dev/null && echo 1) || \
+                        (sysctl -n machdep.cpu.features 2>/dev/null | grep -q AVX2 && echo 1) || \
+                        (sysctl -n machdep.cpu.leaf7_features 2>/dev/null | grep -q AVX2 && echo 1) || \
+                        echo 0)
     
     # Enable the best available SIMD instruction set
-    ifneq ($(HAS_AVX512), 0)
+    ifeq ($(HAS_AVX512), 1)
         CFLAGS += -mavx512f -mavx512bw -msse4.2 -mavx2
-    else ifneq ($(HAS_AVX2), 0)
+    else ifeq ($(HAS_AVX2), 1)
         CFLAGS += -mavx2 -msse4.2
     else
         # Fallback to SSE4.2 which is widely supported on x86_64
