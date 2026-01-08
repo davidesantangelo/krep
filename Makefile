@@ -1,29 +1,46 @@
 # krep - A high-performance string search utility
 # Author: Davide Santangelo
-# Version: 0.4.2
+# Version: 1.4.2
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O3 -ffast-math -std=c11 -pthread -D_GNU_SOURCE -D_DEFAULT_SOURCE \
-         -flto
+         -flto -funroll-loops -finline-functions
 LDFLAGS = -pthread -flto
 
-# Detect architecture for SIMD flags (basic example)
+# Build mode: set NATIVE=1 for maximum performance on local machine
+# Example: make NATIVE=1
+ifdef NATIVE
+    CFLAGS += -march=native -mtune=native
+endif
+
+# Detect architecture for SIMD flags
 ARCH := $(shell uname -m)
 
 ifeq ($(ARCH), x86_64)
-    # Check for AVX2 support (requires CPU supporting it)
-    # This check might need refinement based on specific CPU features
-    # For simplicity, we'll enable SSE4.2 by default on x86_64
-    CFLAGS += -msse4.2
-    # To enable AVX2, uncomment the line below and ensure your CPU supports it
-    # CFLAGS += -mavx2
+    # Check for AVX-512 support
+    HAS_AVX512 := $(shell cat /proc/cpuinfo 2>/dev/null | grep -c avx512f || sysctl -a 2>/dev/null | grep -c AVX512F || echo 0)
+    # Check for AVX2 support
+    HAS_AVX2 := $(shell cat /proc/cpuinfo 2>/dev/null | grep -c avx2 || sysctl -a 2>/dev/null | grep -c AVX2 || echo 0)
+    
+    # Enable the best available SIMD instruction set
+    ifneq ($(HAS_AVX512), 0)
+        CFLAGS += -mavx512f -mavx512bw -msse4.2 -mavx2
+    else ifneq ($(HAS_AVX2), 0)
+        CFLAGS += -mavx2 -msse4.2
+    else
+        # Fallback to SSE4.2 which is widely supported on x86_64
+        CFLAGS += -msse4.2
+    endif
 else ifeq ($(ARCH), arm64)
     # Enable NEON for arm64 (Apple Silicon, etc.)
     CFLAGS += -D__ARM_NEON
     # Note: GCC might enable NEON automatically on arm64, but explicit flag is safer
+else ifeq ($(ARCH), aarch64)
+    # Enable NEON for aarch64 Linux
+    CFLAGS += -D__ARM_NEON
 endif
 
 # Source files

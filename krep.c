@@ -41,17 +41,25 @@ static bool is_repetitive_pattern(const char *pattern, size_t pattern_len);
 static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr, size_t current_pos, size_t needed);
 
 // SIMD Intrinsics Includes based on compiler flags (from Makefile)
-#if defined(__AVX2__)
-#include <immintrin.h> // AVX2 intrinsics
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h> // AVX-512 intrinsics
+#define KREP_USE_AVX512 1
 #define KREP_USE_AVX2 1
+#define KREP_USE_SSE42 1
+#elif defined(__AVX2__)
+#include <immintrin.h> // AVX2 intrinsics
+#define KREP_USE_AVX512 0
+#define KREP_USE_AVX2 1
+#define KREP_USE_SSE42 1
 #else
+#define KREP_USE_AVX512 0
 #define KREP_USE_AVX2 0
 #endif
 
-#if defined(__SSE4_2__)
+#if defined(__SSE4_2__) && !KREP_USE_AVX2
 #include <nmmintrin.h> // SSE4.2 intrinsics
 #define KREP_USE_SSE42 1
-#else
+#elif !defined(KREP_USE_SSE42)
 #define KREP_USE_SSE42 0
 #endif
 
@@ -65,19 +73,32 @@ static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr,
 // Constants
 #define MAX_PATTERN_LENGTH 1024
 #define DEFAULT_THREAD_COUNT 0
-#define MIN_CHUNK_SIZE (4 * 1024 * 1024)
+#define MIN_CHUNK_SIZE (2 * 1024 * 1024)        // Reduced for better parallelism
+#define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "1.4"
+#define VERSION "1.4.2"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 #define BINARY_CHECK_BUFFER_SIZE 1024  // Bytes to check for binary content
 #define MAX_PATTERN_FILE_LINE_LEN 2048 // Max length for a pattern line read from file
+#define CACHE_LINE_SIZE 64             // Modern CPU cache line size
+#define PREFETCH_DISTANCE 512          // Bytes ahead to prefetch
+
+// Compiler hints for better optimization
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define ALWAYS_INLINE __attribute__((always_inline)) inline
+#define HOT_FUNCTION __attribute__((hot))
+#define CACHE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
 
 // Determine max pattern length usable by SIMD based on highest available instruction set
 // NOTE: Current SIMD implementations only support case-sensitive search.
-#if KREP_USE_AVX2
+#if KREP_USE_AVX512
+// AVX-512 implementation handles <= 64 bytes.
+const size_t SIMD_MAX_PATTERN_LEN = 64;
+#elif KREP_USE_AVX2
 // AVX2 implementation handles <= 32 bytes.
 const size_t SIMD_MAX_PATTERN_LEN = 32;
 #elif KREP_USE_SSE42
@@ -1151,7 +1172,7 @@ inline bool memory_equals_case_insensitive(const unsigned char *s1, const unsign
     return true;
 }
 
-// --- Boyer-Moore-Horspool Algorithm ---
+// --- Boyer-Moore-Horspool Algorithm with Turbo Shift ---
 
 // Prepare the bad character table for BMH
 void prepare_bad_char_table(const unsigned char *pattern, size_t pattern_len, int *bad_char_table, bool case_sensitive)
@@ -1196,14 +1217,71 @@ void prepare_bad_char_table(const unsigned char *pattern, size_t pattern_len, in
     }
 }
 
+// Prepare good suffix table for Boyer-Moore (turbo shift enhancement)
+static void prepare_good_suffix_table(const unsigned char *pattern, size_t pattern_len, 
+                                       int *good_suffix_table, int *suffix_table)
+{
+    size_t m = pattern_len;
+    
+    // Compute suffix table
+    suffix_table[m - 1] = m;
+    int g = m - 1;
+    int f = 0;
+    
+    for (int i = (int)m - 2; i >= 0; --i)
+    {
+        if (i > g && suffix_table[i + m - 1 - f] < i - g)
+        {
+            suffix_table[i] = suffix_table[i + m - 1 - f];
+        }
+        else
+        {
+            if (i < g)
+                g = i;
+            f = i;
+            while (g >= 0 && pattern[g] == pattern[g + m - 1 - f])
+                --g;
+            suffix_table[i] = f - g;
+        }
+    }
+    
+    // Compute good suffix shifts
+    for (size_t i = 0; i < m; i++)
+    {
+        good_suffix_table[i] = m;
+    }
+    
+    int j = 0;
+    for (int i = (int)m - 1; i >= 0; --i)
+    {
+        if (suffix_table[i] == i + 1)
+        {
+            for (; j < (int)m - 1 - i; ++j)
+            {
+                if (good_suffix_table[j] == (int)m)
+                {
+                    good_suffix_table[j] = (int)m - 1 - i;
+                }
+            }
+        }
+    }
+    
+    for (size_t i = 0; i <= m - 2; i++)
+    {
+        good_suffix_table[m - 1 - suffix_table[i]] = (int)m - 1 - i;
+    }
+}
+
 // Adds positions to 'result' if params->track_positions is true.
+// Enhanced with turbo shift and prefetching for maximum performance
+HOT_FUNCTION
 uint64_t boyer_moore_search(const search_params_t *params,
                             const char *text_start,
                             size_t text_len,
                             match_result_t *result) // For position tracking (can be NULL)
 {
     // --- Add max_count == 0 check ---
-    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+    if (UNLIKELY(params->max_count == 0 && (params->count_lines_mode || params->track_positions)))
         return 0;
     // --- End add ---
 
@@ -1215,11 +1293,36 @@ uint64_t boyer_moore_search(const search_params_t *params,
     bool track_positions = params->track_positions;
     size_t max_count = params->max_count;
 
-    if (pattern_len == 0 || text_len < pattern_len)
+    if (UNLIKELY(pattern_len == 0 || text_len < pattern_len))
         return 0;
 
+    // Prepare bad character table
     int bad_char_table[256];
     prepare_bad_char_table(search_pattern, pattern_len, bad_char_table, case_sensitive);
+    
+    // Prepare good suffix table for turbo shift (only for longer patterns)
+    int *good_suffix_table = NULL;
+    int *suffix_table = NULL;
+    bool use_turbo = (pattern_len >= 4 && pattern_len <= 256);
+    
+    if (use_turbo)
+    {
+        good_suffix_table = malloc(pattern_len * sizeof(int));
+        suffix_table = malloc(pattern_len * sizeof(int));
+        if (good_suffix_table && suffix_table)
+        {
+            prepare_good_suffix_table(search_pattern, pattern_len, good_suffix_table, suffix_table);
+        }
+        else
+        {
+            // Fallback if allocation fails
+            use_turbo = false;
+            free(good_suffix_table);
+            free(suffix_table);
+            good_suffix_table = NULL;
+            suffix_table = NULL;
+        }
+    }
 
     uint64_t current_count = 0;
     size_t last_counted_line_start = SIZE_MAX;
@@ -1228,23 +1331,42 @@ uint64_t boyer_moore_search(const search_params_t *params,
 
     // Hoist pattern's last char once
     unsigned char pc_last = search_pattern[pattern_len - 1];
+    unsigned char pc_last_lower = case_sensitive ? pc_last : lower_table[pc_last];
+
+    // Turbo shift variables
+    size_t turbo_shift = 0;
+    size_t turbo_len = 0;
 
     while (i < search_limit)
     {
-        unsigned char tc_last = utext_start[i + pattern_len - 1];
+        // Prefetch ahead for better cache utilization
+        if (LIKELY(i + PREFETCH_DISTANCE < text_len))
+            __builtin_prefetch(utext_start + i + PREFETCH_DISTANCE, 0, 0);
 
-        bool last_char_match = case_sensitive
-                                   ? (tc_last == pc_last)
-                                   : (lower_table[tc_last] == lower_table[pc_last]);
+        unsigned char tc_last = utext_start[i + pattern_len - 1];
+        unsigned char tc_last_cmp = case_sensitive ? tc_last : lower_table[tc_last];
+
+        bool last_char_match = (tc_last_cmp == pc_last_lower);
 
         if (last_char_match)
         {
             bool full_match = true;
+            size_t j = pattern_len - 1;
+            
+            // Compare from right to left
             if (pattern_len > 1)
             {
                 if (case_sensitive)
                 {
-                    full_match = (memcmp(utext_start + i, search_pattern, pattern_len - 1) == 0);
+                    // Optimized comparison with early exit
+                    for (j = pattern_len - 1; j > 0; --j)
+                    {
+                        if (utext_start[i + j - 1] != search_pattern[j - 1])
+                        {
+                            full_match = false;
+                            break;
+                        }
+                    }
                 }
                 else
                 {
@@ -1260,8 +1382,10 @@ uint64_t boyer_moore_search(const search_params_t *params,
                     unsigned char bad = tc_last;
                     int shift_val = bad_char_table[bad];
                     i += shift_val;
+                    turbo_shift = 0;
                     continue;
                 }
+                
                 bool count_incremented_this_match = false;
                 if (count_lines_mode)
                 {
@@ -1289,20 +1413,59 @@ uint64_t boyer_moore_search(const search_params_t *params,
                 if (count_incremented_this_match && current_count >= max_count)
                     break;
 
-                unsigned char bad = tc_last;
-                int shift_val = bad_char_table[bad];
+                // After match: advance by pattern length (non-overlapping matches)
                 if (only_matching && !params->count_lines_mode)
                     i += pattern_len;
                 else
-                    i += shift_val;
+                {
+                    int shift_val = bad_char_table[tc_last];
+                    i += (shift_val > 1) ? shift_val : 1;
+                }
+                turbo_shift = 0;
+                turbo_len = 0;
+                continue;
+            }
+            else
+            {
+                // Mismatch occurred - compute shift using both heuristics
+                int bc_shift = bad_char_table[tc_last];
+                int gs_shift = 1;
+                
+                if (use_turbo && good_suffix_table)
+                {
+                    gs_shift = good_suffix_table[j];
+                    
+                    // Turbo-BM optimization
+                    if (turbo_len >= j && turbo_shift != (size_t)gs_shift)
+                    {
+                        size_t shift = (turbo_len > pattern_len - j) ? 
+                                        turbo_len - pattern_len + j + 1 : 1;
+                        if (shift > (size_t)gs_shift)
+                            gs_shift = shift;
+                    }
+                }
+                
+                int shift_val = (bc_shift > gs_shift) ? bc_shift : gs_shift;
+                
+                // Save turbo state
+                turbo_len = (bc_shift > gs_shift) ? 0 : pattern_len - j;
+                turbo_shift = shift_val;
+                
+                i += shift_val;
                 continue;
             }
         }
 
-        unsigned char bad = tc_last;
-        int shift_val = bad_char_table[bad];
+        // No last char match - use bad character shift
+        int shift_val = bad_char_table[tc_last];
+        turbo_shift = 0;
+        turbo_len = 0;
         i += shift_val;
     }
+
+    // Cleanup
+    if (good_suffix_table) free(good_suffix_table);
+    if (suffix_table) free(suffix_table);
 
     return current_count;
 }
@@ -1714,7 +1877,9 @@ search_func_t select_search_algorithm(const search_params_t *params)
         if (can_use_simd && params->case_sensitive)
         {
 // Use SIMD for short case-sensitive patterns if available
-#if KREP_USE_AVX2
+#if KREP_USE_AVX512
+            return simd_avx512_search;
+#elif KREP_USE_AVX2
             return simd_avx2_search;
 #elif KREP_USE_SSE42
             return simd_sse42_search;
@@ -1734,6 +1899,11 @@ search_func_t select_search_algorithm(const search_params_t *params)
     // For patterns 4 characters or longer, follow existing logic
     if (can_use_simd)
     {
+#if KREP_USE_AVX512
+        // AVX-512 supports patterns up to 64 bytes (case-sensitive only)
+        if (params->pattern_len <= 64 && params->case_sensitive)
+            return simd_avx512_search;
+#endif
 #if KREP_USE_AVX2
         // AVX2 supports case-insensitive up to 32 bytes
         if (params->pattern_len <= 32)
@@ -1859,7 +2029,7 @@ void *search_chunk_thread(void *arg)
 const char *get_algorithm_name(search_func_t func)
 {
     if (func == boyer_moore_search)
-        return "Boyer-Moore-Horspool";
+        return "Boyer-Moore-Turbo";
     else if (func == kmp_search)
         return "Knuth-Morris-Pratt";
     else if (func == regex_search)
@@ -1877,6 +2047,10 @@ const char *get_algorithm_name(search_func_t func)
 #if KREP_USE_AVX2
     else if (func == simd_avx2_search)
         return "AVX2";
+#endif
+#if KREP_USE_AVX512
+    else if (func == simd_avx512_search)
+        return "AVX-512";
 #endif
 #if KREP_USE_NEON
     else if (func == neon_search)
@@ -3741,6 +3915,9 @@ thread_pool_t *thread_pool_init(int num_threads)
         {
             num_threads = 4; // Fallback to a reasonable default
         }
+        // Use slightly fewer threads than cores to leave headroom
+        if (num_threads > 2)
+            num_threads = num_threads - 1;
     }
 
     thread_pool_t *pool = malloc(sizeof(thread_pool_t));
@@ -3763,12 +3940,20 @@ thread_pool_t *thread_pool_init(int num_threads)
     pool->working_threads = 0;
     atomic_init(&pool->shutdown, false);
 
-    if (pthread_mutex_init(&pool->queue_mutex, NULL) != 0)
+    // Initialize mutex with PTHREAD_MUTEX_ADAPTIVE_NP for better spin behavior
+    pthread_mutexattr_t mutex_attr;
+    pthread_mutexattr_init(&mutex_attr);
+#ifdef PTHREAD_MUTEX_ADAPTIVE_NP
+    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+#endif
+    if (pthread_mutex_init(&pool->queue_mutex, &mutex_attr) != 0)
     {
+        pthread_mutexattr_destroy(&mutex_attr);
         free(pool->threads);
         free(pool);
         return NULL;
     }
+    pthread_mutexattr_destroy(&mutex_attr);
 
     if (pthread_cond_init(&pool->queue_cond, NULL) != 0)
     {
@@ -3787,10 +3972,17 @@ thread_pool_t *thread_pool_init(int num_threads)
         return NULL;
     }
 
+    // Set thread attributes for better performance
+    pthread_attr_t thread_attr;
+    pthread_attr_init(&thread_attr);
+    
+    // Set a reasonable stack size (256KB should be enough for search operations)
+    pthread_attr_setstacksize(&thread_attr, 256 * 1024);
+
     // Create worker threads
     for (int i = 0; i < num_threads; i++)
     {
-        if (pthread_create(&pool->threads[i], NULL, thread_pool_worker, pool) != 0)
+        if (pthread_create(&pool->threads[i], &thread_attr, thread_pool_worker, pool) != 0)
         {
             // Handle failure - stop and clean up
             atomic_store(&pool->shutdown, true);
@@ -3802,6 +3994,7 @@ thread_pool_t *thread_pool_init(int num_threads)
                 pthread_join(pool->threads[j], NULL);
             }
 
+            pthread_attr_destroy(&thread_attr);
             pthread_cond_destroy(&pool->complete_cond);
             pthread_cond_destroy(&pool->queue_cond);
             pthread_mutex_destroy(&pool->queue_mutex);
@@ -3810,6 +4003,8 @@ thread_pool_t *thread_pool_init(int num_threads)
             return NULL;
         }
     }
+    
+    pthread_attr_destroy(&thread_attr);
 
     return pool;
 }
@@ -3817,7 +4012,7 @@ thread_pool_t *thread_pool_init(int num_threads)
 // Submit a task to the thread pool
 bool thread_pool_submit(thread_pool_t *pool, void *(*func)(void *), void *arg)
 {
-    if (!pool || !func || atomic_load(&pool->shutdown))
+    if (UNLIKELY(!pool || !func || atomic_load(&pool->shutdown)))
     {
         return false;
     }
@@ -3851,6 +4046,49 @@ bool thread_pool_submit(thread_pool_t *pool, void *(*func)(void *), void *arg)
 
     // Signal that work is available
     pthread_cond_signal(&pool->queue_cond);
+    pthread_mutex_unlock(&pool->queue_mutex);
+
+    return true;
+}
+
+// Submit multiple tasks at once for better efficiency
+bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count)
+{
+    if (UNLIKELY(!pool || !func || !args || count <= 0 || atomic_load(&pool->shutdown)))
+    {
+        return false;
+    }
+
+    // Pre-allocate all tasks
+    task_t *tasks = malloc(count * sizeof(task_t));
+    if (!tasks)
+    {
+        return false;
+    }
+
+    // Initialize tasks
+    for (int i = 0; i < count; i++)
+    {
+        tasks[i].func = func;
+        tasks[i].arg = args[i];
+        tasks[i].next = (i < count - 1) ? &tasks[i + 1] : NULL;
+    }
+
+    // Add all tasks to queue at once
+    pthread_mutex_lock(&pool->queue_mutex);
+
+    if (pool->task_queue == NULL)
+    {
+        pool->task_queue = &tasks[0];
+    }
+    else
+    {
+        pool->task_queue_tail->next = &tasks[0];
+    }
+    pool->task_queue_tail = &tasks[count - 1];
+
+    // Broadcast to wake all waiting threads
+    pthread_cond_broadcast(&pool->queue_cond);
     pthread_mutex_unlock(&pool->queue_mutex);
 
     return true;
@@ -4447,6 +4685,10 @@ uint64_t simd_avx2_search(const search_params_t *params,
 
     while (remaining_len >= 32) // Process in 32-byte chunks
     {
+        // Prefetch next cache lines for better memory performance
+        if (LIKELY(remaining_len > PREFETCH_DISTANCE))
+            __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
+
         // Load 32 bytes of text - SAFELY
         __m256i text_vec;
         if (remaining_len < 32)
@@ -4601,6 +4843,165 @@ uint64_t simd_avx2_search(const search_params_t *params,
     }
 
 end_avx2_search:
+    return current_count;
+}
+#endif
+
+#if KREP_USE_AVX512
+// AVX-512 search function - Ultra high-performance search for 64-byte patterns
+// Uses 512-bit registers for maximum throughput on supported hardware
+HOT_FUNCTION
+uint64_t simd_avx512_search(const search_params_t *params,
+                            const char *text_start,
+                            size_t text_len,
+                            match_result_t *result)
+{
+    // Precondition checks
+    if (UNLIKELY(params->pattern_len == 0 || params->pattern_len > 64 || 
+                 !params->case_sensitive || text_len < params->pattern_len))
+    {
+        return simd_avx2_search(params, text_start, text_len, result);
+    }
+    if (UNLIKELY(params->max_count == 0 && (params->count_lines_mode || params->track_positions)))
+        return 0;
+
+    // Use AVX2 for smaller patterns (more efficient)
+    if (params->pattern_len <= 32)
+    {
+        return simd_avx2_search(params, text_start, text_len, result);
+    }
+
+    // --- AVX-512 specific logic for pattern_len > 32 and <= 64 ---
+    uint64_t current_count = 0;
+    const size_t pattern_len = params->pattern_len;
+    const char *pattern = params->pattern;
+    const bool count_lines_mode = params->count_lines_mode;
+    const bool track_positions = params->track_positions;
+    const size_t max_count = params->max_count;
+    size_t last_counted_line_start = SIZE_MAX;
+
+    // Create 512-bit vectors for the first and last bytes of the pattern
+    const __m512i first_byte_vec = _mm512_set1_epi8(pattern[0]);
+    const __m512i last_byte_vec = _mm512_set1_epi8(pattern[pattern_len - 1]);
+
+    const char *current_pos = text_start;
+    size_t remaining_len = text_len;
+
+    // Process in 64-byte chunks (512 bits)
+    while (remaining_len >= 64)
+    {
+        // Aggressive prefetching for streaming access
+        if (LIKELY(remaining_len > PREFETCH_DISTANCE * 2))
+        {
+            __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
+            __builtin_prefetch(current_pos + PREFETCH_DISTANCE * 2, 0, 0);
+        }
+
+        // Load 64 bytes of text
+        __m512i text_vec = _mm512_loadu_si512((const __m512i *)current_pos);
+
+        // Compare first byte of pattern with text
+        __mmask64 first_mask = _mm512_cmpeq_epi8_mask(first_byte_vec, text_vec);
+
+        // Quick exit if no first byte matches
+        if (first_mask == 0)
+        {
+            current_pos += 64;
+            remaining_len -= 64;
+            continue;
+        }
+
+        // Load last byte positions (offset by pattern_len - 1)
+        size_t last_byte_offset = pattern_len - 1;
+        if (remaining_len >= last_byte_offset + 64)
+        {
+            __m512i text_last_byte_vec = _mm512_loadu_si512((const __m512i *)(current_pos + last_byte_offset));
+            __mmask64 last_mask = _mm512_cmpeq_epi8_mask(last_byte_vec, text_last_byte_vec);
+
+            // Combine masks: potential match starts where both first and last bytes match
+            uint64_t potential_starts_mask = first_mask & last_mask;
+
+            // Process all potential matches
+            while (potential_starts_mask != 0)
+            {
+                // Find the index of the lowest set bit
+                int index = __builtin_ctzll(potential_starts_mask);
+
+                // Verify full pattern match
+                if (memcmp(current_pos + index, pattern, pattern_len) == 0)
+                {
+                    size_t match_start_offset = (current_pos - text_start) + index;
+
+                    // Whole word check
+                    if (params->whole_word && 
+                        !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
+                    {
+                        potential_starts_mask &= potential_starts_mask - 1;
+                        continue;
+                    }
+
+                    bool count_incremented = false;
+
+                    if (count_lines_mode)
+                    {
+                        size_t line_start = find_line_start(text_start, text_len, match_start_offset);
+                        if (line_start != last_counted_line_start)
+                        {
+                            current_count++;
+                            last_counted_line_start = line_start;
+                            count_incremented = true;
+                        }
+                    }
+                    else
+                    {
+                        current_count++;
+                        count_incremented = true;
+                        if (track_positions && result && current_count <= max_count)
+                        {
+                            match_result_add(result, match_start_offset, match_start_offset + pattern_len);
+                        }
+                    }
+
+                    if (count_incremented && current_count >= max_count)
+                    {
+                        return current_count;
+                    }
+                }
+
+                potential_starts_mask &= potential_starts_mask - 1;
+            }
+        }
+
+        current_pos += 64;
+        remaining_len -= 64;
+    }
+
+    // Handle tail with AVX2
+    if (remaining_len >= pattern_len)
+    {
+        search_params_t tail_params = *params;
+        if (max_count != SIZE_MAX)
+        {
+            tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
+        }
+
+        uint64_t tail_count = simd_avx2_search(&tail_params, current_pos, remaining_len, result);
+
+        // Fix offsets for tail matches
+        if (result && track_positions && tail_count > 0)
+        {
+            size_t tail_offset = current_pos - text_start;
+            uint64_t start_idx = result->count >= tail_count ? result->count - tail_count : 0;
+            for (uint64_t k = 0; k < tail_count && (start_idx + k) < result->count; ++k)
+            {
+                result->positions[start_idx + k].start_offset += tail_offset;
+                result->positions[start_idx + k].end_offset += tail_offset;
+            }
+        }
+
+        current_count += tail_count;
+    }
+
     return current_count;
 }
 #endif

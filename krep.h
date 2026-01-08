@@ -212,6 +212,10 @@ uint64_t simd_sse42_search(const search_params_t *params, const char *text_start
 uint64_t simd_avx2_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+uint64_t simd_avx512_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
+#endif
+
 #if defined(__ARM_NEON)
 uint64_t neon_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
