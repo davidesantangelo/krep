@@ -145,6 +145,18 @@ The benchmarks above were conducted using the subtitles2016-sample.en.gz dataset
 curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
 ```
 
+### Quick comparison vs ripgrep (cached 64 MB file)
+
+Count mode on a warm cache, using a synthetic 64 MB text file and the pattern `needle`:
+
+| Tool | Command | Real Time (s) |
+| --- | --- | ---: |
+| krep (auto threads) | `krep -c "needle" /tmp/krep_bench.txt` | 0.05 |
+| krep (8 threads) | `krep -c -t 8 "needle" /tmp/krep_bench.txt` | 0.02 |
+| ripgrep | `rg -c "needle" /tmp/krep_bench.txt` | 0.07 |
+
+_Measured on a 10-core macOS system with a cached file. Results will vary depending on hardware, storage, and cache state._
+
 ## How Krep Works
 
 Krep achieves its high performance through several key techniques:
