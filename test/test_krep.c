@@ -409,6 +409,47 @@ void test_whole_word_option(void)
 }
 
 /**
+ * Test -c behavior with multiple matches per line
+ */
+void test_count_lines_multiple_matches(void)
+{
+    printf("\n=== Count Lines (-c) Multiple Matches Tests ===\n");
+
+    const char *text = "match match match\nno hits here\nmatch match\n";
+    size_t text_len = strlen(text);
+    match_result_t *result = NULL;
+
+    search_params_t params_bm = create_literal_params("match", true, true, false);
+    TEST_ASSERT(boyer_moore_search(&params_bm, text, text_len, result) == 2,
+                "BM -c counts each matching line once");
+    cleanup_params(&params_bm);
+
+    search_params_t params_kmp = create_literal_params("match", true, true, false);
+    TEST_ASSERT(kmp_search(&params_kmp, text, text_len, result) == 2,
+                "KMP -c counts each matching line once");
+    cleanup_params(&params_kmp);
+
+    const char *short_text = "abxxab\nxxab\n";
+    size_t short_len = strlen(short_text);
+    search_params_t params_short = create_literal_params("ab", true, true, false);
+    TEST_ASSERT(memchr_short_search(&params_short, short_text, short_len, result) == 2,
+                "memchr-short -c counts each matching line once");
+    cleanup_params(&params_short);
+
+    const char *case_text = "AaA a";
+    size_t case_len = strlen(case_text);
+    search_params_t params_memchr_ci = create_literal_params("a", false, false, false);
+    TEST_ASSERT(memchr_search(&params_memchr_ci, case_text, case_len, result) == 4,
+                "memchr case-insensitive matches all cases");
+    cleanup_params(&params_memchr_ci);
+
+    search_params_t params_regex_c = create_regex_params("match", true, true, false);
+    TEST_ASSERT(regex_search(&params_regex_c, text, text_len, result) == 2,
+                "Regex -c counts each matching line once");
+    cleanup_params(&params_regex_c);
+}
+
+/**
  * Test performance with a simple benchmark using the new structure
  */
 void test_performance_new(void)
@@ -1277,6 +1318,7 @@ int main(void)
     test_edge_cases_new();
     test_case_insensitive_new();
     test_whole_word_option();
+    test_count_lines_multiple_matches();
     test_performance_new();
     test_numeric_patterns_new();
 #if KREP_USE_SSE42 || KREP_USE_AVX2 || KREP_USE_NEON

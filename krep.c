@@ -77,7 +77,7 @@ static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr,
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "1.4.2"
+#define VERSION "1.5.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -1301,6 +1301,18 @@ uint64_t boyer_moore_search(const search_params_t *params,
                         current_count++;
                         last_counted_line_start = line_start;
                         count_incremented_this_match = true;
+
+                        if (current_count >= max_count)
+                            break;
+
+                        // Optimization: skip to the next line for -c mode
+                        size_t line_end = find_line_end(text_start, text_len, line_start);
+                        size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
+                        if (next_line_start > i)
+                        {
+                            i = next_line_start;
+                            continue;
+                        }
                     }
                 }
                 else
@@ -1383,7 +1395,8 @@ uint64_t regex_search(const search_params_t *params,
         pmatch[0].rm_so = 0;
         pmatch[0].rm_eo = rem; // Search up to the remaining length
         // REG_NOTBOL is set if we are not at the absolute start of the original text
-        int eflags = base_eflags | ((cur == text_start) ? 0 : REG_NOTBOL);
+        bool at_line_start = (cur == text_start) || (cur > text_start && cur[-1] == '\n');
+        int eflags = base_eflags | (at_line_start ? 0 : REG_NOTBOL);
 
         int rc = regexec(regex, cur, 1, pmatch, eflags);
 
@@ -1460,6 +1473,16 @@ uint64_t regex_search(const search_params_t *params,
             {
                 count++;
                 last_line = line_start_offset;
+
+                if (count >= max_count)
+                    break;
+
+                // Optimization: skip to the next line for -c mode
+                size_t line_end = find_line_end(text_start, text_len, line_start_offset);
+                size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
+                cur = text_start + next_line_start;
+                rem = (text_start + text_len) - cur;
+                continue;
             }
         }
         else
@@ -3576,7 +3599,8 @@ uint64_t memchr_search(const search_params_t *params,
 
     uint64_t current_count = 0;             // Use local counter for limit check
     const char target = params->pattern[0]; // Single byte pattern
-    const char target_case = params->case_sensitive ? 0 : (islower(target) ? toupper(target) : tolower(target));
+    const unsigned char target_uc = (unsigned char)target;
+    const char target_case = params->case_sensitive ? 0 : (islower(target_uc) ? toupper(target_uc) : tolower(target_uc));
     bool count_lines_mode = params->count_lines_mode;
     bool track_positions = params->track_positions;
     size_t max_count = params->max_count; // Get max_count
@@ -3594,13 +3618,17 @@ uint64_t memchr_search(const search_params_t *params,
     {
         const char *found;
 
-        // Use platform-optimized memchr
+        // Use platform-optimized memchr for the original case
         found = memchr(text_start + pos, target, text_len - pos);
 
-        // Handle case insensitive - we need to check both cases
-        if (!params->case_sensitive && !found && target_case != target)
+        // Handle case-insensitive search: consider both cases and pick the earliest
+        if (!params->case_sensitive && target_case != target)
         {
-            found = memchr(text_start + pos, target_case, text_len - pos);
+            const char *found_case = memchr(text_start + pos, target_case, text_len - pos);
+            if (!found || (found_case && found_case < found))
+            {
+                found = found_case;
+            }
         }
 
         if (!found)
@@ -4107,6 +4135,19 @@ uint64_t memchr_short_search(const search_params_t *params,
                     current_count++;
                     last_counted_line_start = line_start;
                     count_incremented_this_match = true;
+
+                    if (current_count >= max_count)
+                        break;
+
+                    // Optimization: skip to the next line for -c mode
+                    size_t line_end = find_line_end(text_start, text_len, line_start);
+                    size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
+                    if (next_line_start > (size_t)(current_pos - text_start))
+                    {
+                        current_pos = text_start + next_line_start;
+                        remaining_len = text_len - next_line_start;
+                        continue;
+                    }
                 }
             }
             else
@@ -4552,6 +4593,7 @@ uint64_t simd_avx2_search(const search_params_t *params,
 
     while (remaining_len >= 32) // Process in 32-byte chunks
     {
+        bool line_skipped = false;
         // Prefetch next cache lines for better memory performance
         if (LIKELY(remaining_len > PREFETCH_DISTANCE))
             __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
@@ -4632,6 +4674,26 @@ uint64_t simd_avx2_search(const search_params_t *params,
                         current_count++;
                         last_counted_line_start = line_start;
                         count_incremented_this_match = true;
+
+                        if (current_count >= max_count)
+                        {
+                            goto end_avx2_search;
+                        }
+
+                        // Optimization: skip to next line for -c mode
+                        size_t line_end = find_line_end(text_start, text_len, line_start);
+                        size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
+                        size_t current_offset = (size_t)(current_pos - text_start);
+                        if (next_line_start > current_offset)
+                        {
+                            size_t advance = next_line_start - current_offset;
+                            if (advance > remaining_len)
+                                advance = remaining_len;
+                            current_pos += advance;
+                            remaining_len -= advance;
+                            line_skipped = true;
+                            break;
+                        }
                     }
                 }
                 else
@@ -4659,6 +4721,11 @@ uint64_t simd_avx2_search(const search_params_t *params,
 
             // Clear the found bit to find the next potential start
             potential_starts_mask &= potential_starts_mask - 1;
+        }
+
+        if (line_skipped)
+        {
+            continue;
         }
 
         // Advance position. Advance by 32 for simplicity, might miss overlaps near boundary.
@@ -4757,6 +4824,7 @@ uint64_t simd_avx512_search(const search_params_t *params,
     // Process in 64-byte chunks (512 bits)
     while (remaining_len >= 64)
     {
+        bool line_skipped = false;
         // Aggressive prefetching for streaming access
         if (LIKELY(remaining_len > PREFETCH_DISTANCE * 2))
         {
@@ -4817,6 +4885,26 @@ uint64_t simd_avx512_search(const search_params_t *params,
                             current_count++;
                             last_counted_line_start = line_start;
                             count_incremented = true;
+
+                            if (current_count >= max_count)
+                            {
+                                return current_count;
+                            }
+
+                            // Optimization: skip to the next line for -c mode
+                            size_t line_end = find_line_end(text_start, text_len, line_start);
+                            size_t next_line_start = (line_end < text_len) ? line_end + 1 : text_len;
+                            size_t current_offset = (size_t)(current_pos - text_start);
+                            if (next_line_start > current_offset)
+                            {
+                                size_t advance = next_line_start - current_offset;
+                                if (advance > remaining_len)
+                                    advance = remaining_len;
+                                current_pos += advance;
+                                remaining_len -= advance;
+                                line_skipped = true;
+                                break;
+                            }
                         }
                     }
                     else
@@ -4836,6 +4924,11 @@ uint64_t simd_avx512_search(const search_params_t *params,
                 }
 
                 potential_starts_mask &= potential_starts_mask - 1;
+            }
+
+            if (line_skipped)
+            {
+                continue;
             }
         }
 
