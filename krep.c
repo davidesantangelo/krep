@@ -39,6 +39,8 @@ static bool is_repetitive_pattern(const char *pattern, size_t pattern_len);
 
 // Forward declaration for ensure_line_buffer_capacity
 static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr, size_t current_pos, size_t needed);
+// Submit multiple tasks in one lock/unlock roundtrip.
+static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count);
 
 // SIMD Intrinsics Includes based on compiler flags (from Makefile)
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -77,7 +79,7 @@ static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr,
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "1.5.0"
+#define VERSION "2.0.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -2240,11 +2242,14 @@ int search_file(const search_params_t *params, const char *filename, int request
     match_result_t *global_matches = NULL;       // Global result collection
     pthread_t *threads = NULL;                   // Thread handles
     thread_data_t *thread_args = NULL;           // Thread arguments
+    void **pool_task_args = NULL;                // Arguments for thread-pool batch submission
     regex_t compiled_regex_local;                // For local regex compilation
     char *combined_regex_pattern = NULL;         // For combined regex patterns
     int actual_thread_count = 0;                 // Number of threads to actually use
     uint64_t final_count = 0;                    // Total count of lines or matches
     size_t max_count = current_params.max_count; // Get max_count
+    bool use_thread_pool = false;                // True if this file search uses the global thread pool
+    bool run_single_thread_inline = false;       // True if we run one chunk directly in current thread
 
     // Validate patterns for literal search (not for regex)
     if (!current_params.use_regex)
@@ -2695,17 +2700,60 @@ int search_file(const search_params_t *params, const char *filename, int request
     if (actual_thread_count <= 0)
         actual_thread_count = 1;
 
-    // --- Initialize Threading Resources ---
-    threads = malloc(actual_thread_count * sizeof(pthread_t));
-    thread_args = malloc(actual_thread_count * sizeof(thread_data_t));
-    if (threads)
-        memset(threads, 0, actual_thread_count * sizeof(pthread_t));
+    // Determine how many threads to use based on file size and available cores
+    int available_cores = requested_thread_count > 0 ? requested_thread_count : sysconf(_SC_NPROCESSORS_ONLN);
+    if (available_cores <= 0)
+        available_cores = 1;
 
-    if (!threads || !thread_args)
+    // Calculate optimal number of threads: min(cores, max(1, file_size/(4MB)))
+    // This scales threads with file size, but caps at CPU core count.
+    int optimal_threads = 1;
+    if (file_size > 0)
     {
-        perror("krep: Cannot allocate thread resources");
+        size_t chunk_threshold = 4 * 1024 * 1024; // 4MB per thread minimum
+        optimal_threads = (int)(file_size / chunk_threshold);
+        if (optimal_threads > available_cores)
+            optimal_threads = available_cores;
+        if (optimal_threads < 1)
+            optimal_threads = 1;
+    }
+
+    // Avoid thread and queue overhead when there is only one chunk.
+    run_single_thread_inline = (actual_thread_count == 1);
+    if (!run_single_thread_inline)
+    {
+        init_global_thread_pool(optimal_threads);
+        use_thread_pool = (global_thread_pool != NULL);
+    }
+
+    // --- Initialize Threading Resources ---
+    thread_args = calloc((size_t)actual_thread_count, sizeof(thread_data_t));
+    if (!thread_args)
+    {
+        perror("krep: Cannot allocate thread arguments");
         result_code = 2;
         goto cleanup_file;
+    }
+
+    if (use_thread_pool)
+    {
+        pool_task_args = malloc((size_t)actual_thread_count * sizeof(void *));
+        if (!pool_task_args)
+        {
+            perror("krep: Cannot allocate thread-pool task arguments");
+            result_code = 2;
+            goto cleanup_file;
+        }
+    }
+    else if (!run_single_thread_inline)
+    {
+        threads = calloc((size_t)actual_thread_count, sizeof(pthread_t));
+        if (!threads)
+        {
+            perror("krep: Cannot allocate pthread handles");
+            result_code = 2;
+            goto cleanup_file;
+        }
     }
 
     // Allocate global results structure if tracking positions
@@ -2738,7 +2786,9 @@ int search_file(const search_params_t *params, const char *filename, int request
     }
 
     size_t current_pos = 0;
-    int threads_launched = 0;
+    int chunks_launched = 0;
+    const int planned_thread_count = actual_thread_count;
+
     // Calculate max pattern length for overlap (only for literal search)
     size_t max_literal_pattern_len = 0;
     if (!current_params.use_regex)
@@ -2752,47 +2802,22 @@ int search_file(const search_params_t *params, const char *filename, int request
         }
     }
 
-    // Determine how many threads to use based on file size and available cores
-    int available_cores = requested_thread_count > 0 ? requested_thread_count : sysconf(_SC_NPROCESSORS_ONLN);
-    if (available_cores <= 0)
-        available_cores = 1;
-
-    // Calculate optimal number of threads: min(cores, max(1, file_size/(4MB)))
-    // This scales threads with file size, but caps at CPU core count
-    int optimal_threads = 1;
-    if (file_size > 0)
-    {
-        size_t chunk_threshold = 4 * 1024 * 1024; // 4MB per thread minimum
-        optimal_threads = file_size / chunk_threshold;
-        if (optimal_threads > available_cores)
-            optimal_threads = available_cores;
-        if (optimal_threads < 1)
-            optimal_threads = 1;
-    }
-
-    // Initialize the global thread pool if needed
-    init_global_thread_pool(optimal_threads);
-
     // Preselect search algorithm once to avoid redundant decisions inside each worker
     search_func_t preselected_algo = select_search_algorithm(&current_params);
 
-    for (int i = 0; i < actual_thread_count; ++i)
+    for (int i = 0; i < planned_thread_count; ++i)
     {
         if (current_pos >= file_size)
         {
-            actual_thread_count = i; // Update actual count
             break;
         }
 
-        thread_args[i].thread_id = i;
-        thread_args[i].params = &current_params; // Pass params containing the pre-built trie
-        thread_args[i].chunk_start = file_data + current_pos;
-        thread_args[i].search_algo = preselected_algo;
-
         size_t this_chunk_len = (current_pos + chunk_size_calc > file_size) ? (file_size - current_pos) : chunk_size_calc;
+        if (this_chunk_len == 0)
+            break;
 
         // Overlap needed for literal patterns. Regex handled differently (often needs no overlap or different logic).
-        size_t overlap = (!current_params.use_regex && max_literal_pattern_len > 0 && i < actual_thread_count - 1) ? max_literal_pattern_len - 1 : 0;
+        size_t overlap = (!current_params.use_regex && max_literal_pattern_len > 0 && i < planned_thread_count - 1) ? max_literal_pattern_len - 1 : 0;
         size_t effective_chunk_len = (current_pos + this_chunk_len + overlap > file_size) ? (file_size - current_pos) : (this_chunk_len + overlap);
 
         // Ensure chunk length isn't zero if there's still data
@@ -2801,48 +2826,59 @@ int search_file(const search_params_t *params, const char *filename, int request
             effective_chunk_len = file_size - current_pos;
         }
 
-        thread_args[i].chunk_len = effective_chunk_len;
-        thread_args[i].local_result = NULL;
-        thread_args[i].count_result = 0;
-        thread_args[i].error_flag = false;
+        current_pos += this_chunk_len; // Advance by non-overlapped length
+        if (effective_chunk_len == 0)
+            continue;
 
-        if (effective_chunk_len > 0)
+        thread_data_t *slot = &thread_args[chunks_launched];
+        slot->thread_id = chunks_launched;
+        slot->params = &current_params; // Pass params containing the pre-built trie
+        slot->chunk_start = file_data + (current_pos - this_chunk_len);
+        slot->search_algo = preselected_algo;
+        slot->chunk_len = effective_chunk_len;
+        slot->local_result = NULL;
+        slot->count_result = 0;
+        slot->error_flag = false;
+
+        if (run_single_thread_inline)
         {
-            // Use search_chunk_thread which handles multiple patterns via Aho-Corasick or Regex
-            if (global_thread_pool)
+            search_chunk_thread(slot);
+        }
+        else if (use_thread_pool)
+        {
+            pool_task_args[chunks_launched] = slot;
+        }
+        else
+        {
+            int rc = pthread_create(&threads[chunks_launched], NULL, search_chunk_thread, slot);
+            if (rc)
+            {
+                fprintf(stderr, "krep: Error creating thread %d: %s\n", chunks_launched, strerror(rc));
+                threads[chunks_launched] = 0; // Mark as not created
+                slot->error_flag = true;
+            }
+        }
+        chunks_launched++;
+    }
+
+    actual_thread_count = chunks_launched;
+
+    // Submit all tasks at once to reduce queue contention, then wait for completion.
+    if (use_thread_pool && actual_thread_count > 0)
+    {
+        if (!thread_pool_submit_batch(global_thread_pool, search_chunk_thread, pool_task_args, actual_thread_count))
+        {
+            // Fallback to individual submissions if batch allocation fails.
+            for (int i = 0; i < actual_thread_count; ++i)
             {
                 if (!thread_pool_submit(global_thread_pool, search_chunk_thread, &thread_args[i]))
                 {
                     fprintf(stderr, "krep: Failed to submit task for thread %d\n", i);
-                    // Handle error: maybe reduce thread count or abort
-                    thread_args[i].error_flag = true; // Mark thread data as errored
+                    thread_args[i].error_flag = true;
                 }
             }
-            else
-            {
-                int rc = pthread_create(&threads[i], NULL, search_chunk_thread, &thread_args[i]);
-                if (rc)
-                {
-                    fprintf(stderr, "krep: Error creating thread %d: %s\n", i, strerror(rc));
-                    // Handle error: maybe reduce thread count or abort
-                    threads[i] = 0;                   // Mark as not created
-                    thread_args[i].error_flag = true; // Mark thread data as errored
-                    continue;                         // Try launching fewer threads
-                }
-            }
-            threads_launched++;
         }
-        else
-        {
-            threads[i] = 0; // Mark as not launched
-        }
-        current_pos += this_chunk_len; // Advance by non-overlapped length
-    }
-    actual_thread_count = threads_launched;
 
-    // Wait for all tasks to complete
-    if (global_thread_pool)
-    {
         thread_pool_wait_all(global_thread_pool);
     }
 
@@ -2852,7 +2888,7 @@ int search_file(const search_params_t *params, const char *filename, int request
     {
         // Skip the pthread_join logic if using thread pool (tasks are already complete)
         // Only try to join if not using thread pool and thread was actually created
-        if (!global_thread_pool && threads[i] != 0)
+        if (!use_thread_pool && !run_single_thread_inline && threads && threads[i] != 0)
         {
             int rc = pthread_join(threads[i], NULL);
             if (rc)
@@ -2974,6 +3010,7 @@ cleanup_file:
     match_result_free(global_matches);
     free(threads);
     free(thread_args);
+    free(pool_task_args);
     if (fd != -1)
         close(fd);
     // Free the Aho-Corasick trie if it was built for this file
@@ -3019,10 +3056,9 @@ static bool should_skip_extension(const char *filename)
         return false; // Not an extension we care about
     }
 
-    // Check for .min. files (minified files like .min.js, .min.css)
-    // These are common enough to merit a special check
-    const char *min_ext = strstr(dot, ".min.");
-    if (min_ext && min_ext == dot)
+    // Check for minified assets (e.g. app.min.js, style.min.css)
+    const char *min_ext = strstr(filename, ".min.");
+    if (min_ext != NULL)
     {
         return true; // Skip minified files
     }
@@ -3511,9 +3547,6 @@ int main(int argc, char *argv[])
 
     // If counting (-c) or printing only matches (-o), disable summary
 
-    // Initialize thread pool early with the requested thread count
-    init_global_thread_pool(thread_count);
-
     // --- Execute Search ---
     int exit_code = 1; // Default exit code: 1 (no match found)
 
@@ -3947,26 +3980,45 @@ bool thread_pool_submit(thread_pool_t *pool, void *(*func)(void *), void *arg)
 }
 
 // Submit multiple tasks at once for better efficiency
-bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count)
+static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count)
 {
     if (UNLIKELY(!pool || !func || !args || count <= 0 || atomic_load(&pool->shutdown)))
     {
         return false;
     }
 
-    // Pre-allocate all tasks
-    task_t *tasks = malloc(count * sizeof(task_t));
-    if (!tasks)
-    {
-        return false;
-    }
-
-    // Initialize tasks
+    // Build a temporary linked list of heap-allocated tasks.
+    // Each worker frees its own task node after execution.
+    task_t *head = NULL;
+    task_t *tail = NULL;
     for (int i = 0; i < count; i++)
     {
-        tasks[i].func = func;
-        tasks[i].arg = args[i];
-        tasks[i].next = (i < count - 1) ? &tasks[i + 1] : NULL;
+        task_t *task = malloc(sizeof(task_t));
+        if (!task)
+        {
+            while (head)
+            {
+                task_t *next = head->next;
+                free(head);
+                head = next;
+            }
+            return false;
+        }
+
+        task->func = func;
+        task->arg = args[i];
+        task->next = NULL;
+
+        if (!head)
+        {
+            head = task;
+            tail = task;
+        }
+        else
+        {
+            tail->next = task;
+            tail = task;
+        }
     }
 
     // Add all tasks to queue at once
@@ -3974,13 +4026,13 @@ bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void *
 
     if (pool->task_queue == NULL)
     {
-        pool->task_queue = &tasks[0];
+        pool->task_queue = head;
     }
     else
     {
-        pool->task_queue_tail->next = &tasks[0];
+        pool->task_queue_tail->next = head;
     }
-    pool->task_queue_tail = &tasks[count - 1];
+    pool->task_queue_tail = tail;
 
     // Broadcast to wake all waiting threads
     pthread_cond_broadcast(&pool->queue_cond);

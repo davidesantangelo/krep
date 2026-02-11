@@ -1,6 +1,6 @@
 # K(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-1.5.0-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
@@ -129,33 +129,28 @@ cat krep.c | krep 'c'
 
 ## Performance Benchmarks
 
-Comparing performance on the same text file with identical search pattern:
-
-| Tool    | Time (seconds) | CPU Usage |
-| ------- | -------------: | --------: |
-| krep    |          0.106 |      328% |
-| grep    |          4.400 |       99% |
-| ripgrep |          0.115 |       97% |
-
-_Krep is approximately 41.5x faster than grep and slightly faster than ripgrep in this test. Benchmarks performed on Mac Mini M4 with 24GB RAM._
-
-The benchmarks above were conducted using the subtitles2016-sample.en.gz dataset, which can be obtained with:
+Benchmarks are run with the official dataset:
 
 ```bash
 curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
+gzip -dk subtitles2016-sample.en.gz
 ```
 
-### Quick comparison vs ripgrep (cached 64 MB file)
+You can reproduce the `krep` vs `ripgrep` comparison with:
 
-Count mode on a warm cache, using a synthetic 64 MB text file and the pattern `needle`:
+```bash
+make bench-rg
+# optional: RUNS=7 bash test/benchmark_krep_vs_rg.sh Sherlock
+```
 
-| Tool | Command | Real Time (s) |
-| --- | --- | ---: |
-| krep (auto threads) | `krep -c "needle" /tmp/krep_bench.txt` | 0.05 |
-| krep (8 threads) | `krep -c -t 8 "needle" /tmp/krep_bench.txt` | 0.02 |
-| ripgrep | `rg -c "needle" /tmp/krep_bench.txt` | 0.07 |
+### krep v2.0.0 vs ripgrep (warm cache, 7 runs average)
 
-_Measured on a 10-core macOS system with a cached file. Results will vary depending on hardware, storage, and cache state._
+| Pattern | krep avg real (s) | ripgrep avg real (s) | Speedup |
+| --- | ---: | ---: | ---: |
+| `the` | 0.175714 | 0.330000 | 1.88x |
+| `Sherlock` | 0.041429 | 0.080000 | 1.93x |
+
+_Measured on macOS ARM64 with `test/benchmark_krep_vs_rg.sh`. Results vary by CPU, storage and cache state._
 
 ## How Krep Works
 

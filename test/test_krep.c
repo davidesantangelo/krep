@@ -11,7 +11,9 @@
 #include <locale.h>
 #include <inttypes.h> // For PRIu64 format specifier
 #include <limits.h>   // For SIZE_MAX
-#include <unistd.h>   // For sleep (used in placeholder)
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 /* Define TESTING before including headers if not done by Makefile */
 #ifndef TESTING
@@ -51,6 +53,154 @@ int tests_failed = 0;
             tests_failed++;                  \
         }                                    \
     } while (0)
+
+static bool write_multithread_test_file(char *path_template, const char *pattern, uint64_t *expected_lines)
+{
+    if (!path_template || !pattern || !expected_lines)
+        return false;
+
+    int fd = mkstemp(path_template);
+    if (fd == -1)
+    {
+        perror("mkstemp failed for multithread test file");
+        return false;
+    }
+
+    FILE *f = fdopen(fd, "w");
+    if (!f)
+    {
+        perror("fdopen failed for multithread test file");
+        close(fd);
+        unlink(path_template);
+        return false;
+    }
+
+    const char *filler = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ__";
+    const int total_lines = 120000; // Produces a file > 8MB to force multiple chunks.
+    uint64_t expected = 0;
+
+    for (int i = 0; i < total_lines; i++)
+    {
+        bool has_match = ((i % 3) == 0) || ((i % 97) == 0);
+        if (has_match)
+            expected++;
+
+        if (fprintf(f, "line-%06d %s %s %s\n",
+                    i,
+                    has_match ? pattern : "nomatch",
+                    filler,
+                    filler) < 0)
+        {
+            perror("Failed writing multithread test file");
+            fclose(f);
+            unlink(path_template);
+            return false;
+        }
+    }
+
+    if (fclose(f) != 0)
+    {
+        perror("fclose failed for multithread test file");
+        unlink(path_template);
+        return false;
+    }
+
+    *expected_lines = expected;
+    return true;
+}
+
+static bool run_search_file_count_capture(const char *filepath,
+                                          const char *pattern,
+                                          int threads,
+                                          uint64_t *count_out,
+                                          int *exit_code_out)
+{
+    if (!filepath || !pattern || !count_out || !exit_code_out)
+        return false;
+
+    bool ok = false;
+    int saved_stdout = -1;
+    int out_fd = -1;
+    char out_template[] = "/tmp/krep_mt_outputXXXXXX";
+    char output_buffer[1024] = {0};
+    search_params_t params = create_literal_params(pattern, true, true, false);
+
+    out_fd = mkstemp(out_template);
+    if (out_fd == -1)
+    {
+        perror("mkstemp failed for output capture");
+        goto cleanup;
+    }
+
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout == -1)
+    {
+        perror("dup failed while capturing stdout");
+        goto cleanup;
+    }
+
+    fflush(stdout);
+    if (dup2(out_fd, STDOUT_FILENO) == -1)
+    {
+        perror("dup2 failed while redirecting stdout");
+        goto cleanup;
+    }
+
+    *exit_code_out = search_file(&params, filepath, threads);
+    fflush(stdout);
+
+    if (dup2(saved_stdout, STDOUT_FILENO) == -1)
+    {
+        perror("dup2 failed while restoring stdout");
+        goto cleanup;
+    }
+    close(saved_stdout);
+    saved_stdout = -1;
+
+    if (lseek(out_fd, 0, SEEK_SET) == -1)
+    {
+        perror("lseek failed for output capture");
+        goto cleanup;
+    }
+
+    ssize_t n = read(out_fd, output_buffer, sizeof(output_buffer) - 1);
+    if (n < 0)
+    {
+        perror("read failed for output capture");
+        goto cleanup;
+    }
+    output_buffer[n] = '\0';
+
+    char *colon = strrchr(output_buffer, ':');
+    if (!colon)
+    {
+        fprintf(stderr, "Failed to parse count output: '%s'\n", output_buffer);
+        goto cleanup;
+    }
+
+    errno = 0;
+    char *endptr = NULL;
+    unsigned long long parsed = strtoull(colon + 1, &endptr, 10);
+    if (errno != 0 || endptr == colon + 1)
+    {
+        fprintf(stderr, "Failed to parse numeric count output: '%s'\n", output_buffer);
+        goto cleanup;
+    }
+    *count_out = (uint64_t)parsed;
+    ok = true;
+
+cleanup:
+    if (saved_stdout != -1)
+    {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    if (out_fd != -1)
+        close(out_fd);
+    unlink(out_template);
+    cleanup_params(&params);
+    return ok;
+}
 
 /* ========================================================================= */
 /* Common helper for both literal and regex params                          */
@@ -918,21 +1068,41 @@ void test_max_count_new(void)
     ac_trie_free(params_ac.ac_trie);
 }
 
-/**
- * Placeholder test for multithreading.
- * Actual testing requires file I/O and calling search_file.
- */
 void test_multithreading_placeholder_new(void)
 {
     printf("\n=== Testing Parallel Processing ===\n");
-    printf("  Parallel processing tests would validate:\n");
-    printf("  1. Correct match counting across thread boundaries\n");
-    printf("  2. Proper handling of overlapping chunks\n");
-    printf("  3. Thread scaling efficiency\n");
-    printf("  4. Memory mapping and resource cleanup\n");
-    // In a real test, we'd create a temp file, call search_file() with different thread counts,
-    // capture output or check return codes, and verify results.
-    TEST_ASSERT(true, "Placeholder for multi-threaded tests");
+
+    const char *pattern = "FINDME_THREAD_TEST";
+    char temp_path[] = "/tmp/krep_mt_fileXXXXXX";
+    uint64_t expected_count = 0;
+    uint64_t count_single = 0;
+    uint64_t count_multi = 0;
+    int rc_single = -1;
+    int rc_multi = -1;
+
+    bool file_ok = write_multithread_test_file(temp_path, pattern, &expected_count);
+    TEST_ASSERT(file_ok, "Create large temp file for multithread consistency");
+    if (!file_ok)
+        return;
+
+    bool single_ok = run_search_file_count_capture(temp_path, pattern, 1, &count_single, &rc_single);
+    TEST_ASSERT(single_ok, "Single-threaded count capture works");
+
+    bool multi_ok = run_search_file_count_capture(temp_path, pattern, 8, &count_multi, &rc_multi);
+    TEST_ASSERT(multi_ok, "Multi-threaded count capture works");
+
+    if (single_ok)
+        TEST_ASSERT(rc_single == 0, "Single-threaded search_file returns match found");
+    if (multi_ok)
+        TEST_ASSERT(rc_multi == 0, "Multi-threaded search_file returns match found");
+    if (single_ok)
+        TEST_ASSERT(count_single == expected_count, "Single-threaded count matches expected value");
+    if (multi_ok)
+        TEST_ASSERT(count_multi == expected_count, "Multi-threaded count matches expected value");
+    if (single_ok && multi_ok)
+        TEST_ASSERT(count_single == count_multi, "Single-thread and multi-thread produce identical counts");
+
+    unlink(temp_path);
 }
 
 /**

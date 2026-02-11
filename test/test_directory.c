@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 /* Define TESTING before including headers if not done by Makefile */
 #ifndef TESTING
@@ -23,6 +24,9 @@
 // Constants definitions
 #define TEST_DIR_BASE "/tmp/krep_test_dir"
 #define TEST_FILE_MAX_SIZE 8192
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 // Function declarations
 static void create_test_directory_structure(void);
@@ -30,6 +34,99 @@ static void cleanup_test_directory_structure(void);
 static void create_binary_file(const char *path);
 static void create_text_file(const char *path, const char *content);
 static void create_nested_directory(const char *base_path, int depth, int max_depth);
+static bool run_recursive_search_capture(const char *base_dir, const search_params_t *params, int thread_count,
+                                         char *output, size_t output_size, int *errors_out);
+
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+#define TEST_ASSERT(condition, message)      \
+    do                                       \
+    {                                        \
+        if (condition)                       \
+        {                                    \
+            printf("✓ PASS: %s\n", message); \
+            tests_passed++;                  \
+        }                                    \
+        else                                 \
+        {                                    \
+            printf("✗ FAIL: %s\n", message); \
+            tests_failed++;                  \
+        }                                    \
+    } while (0)
+
+static bool run_recursive_search_capture(const char *base_dir, const search_params_t *params, int thread_count,
+                                         char *output, size_t output_size, int *errors_out)
+{
+    if (!base_dir || !params || !output || output_size == 0 || !errors_out)
+        return false;
+
+    bool ok = false;
+    int saved_stdout = -1;
+    int out_fd = -1;
+    char out_template[] = "/tmp/krep_dir_outputXXXXXX";
+
+    output[0] = '\0';
+    *errors_out = -1;
+
+    out_fd = mkstemp(out_template);
+    if (out_fd == -1)
+    {
+        perror("mkstemp failed for directory output capture");
+        goto cleanup;
+    }
+
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout == -1)
+    {
+        perror("dup failed while capturing stdout");
+        goto cleanup;
+    }
+
+    fflush(stdout);
+    if (dup2(out_fd, STDOUT_FILENO) == -1)
+    {
+        perror("dup2 failed while redirecting stdout");
+        goto cleanup;
+    }
+
+    *errors_out = search_directory_recursive(base_dir, params, thread_count);
+    fflush(stdout);
+
+    if (dup2(saved_stdout, STDOUT_FILENO) == -1)
+    {
+        perror("dup2 failed while restoring stdout");
+        goto cleanup;
+    }
+    close(saved_stdout);
+    saved_stdout = -1;
+
+    if (lseek(out_fd, 0, SEEK_SET) == -1)
+    {
+        perror("lseek failed for directory output capture");
+        goto cleanup;
+    }
+
+    ssize_t n = read(out_fd, output, output_size - 1);
+    if (n < 0)
+    {
+        perror("read failed for directory output capture");
+        goto cleanup;
+    }
+    output[n] = '\0';
+    ok = true;
+
+cleanup:
+    if (saved_stdout != -1)
+    {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    if (out_fd != -1)
+        close(out_fd);
+    unlink(out_template);
+    return ok;
+}
 
 /**
  * Nested directory search test
@@ -59,35 +156,32 @@ void test_recursive_directory_search(void)
     params.num_patterns = 1;
     params.case_sensitive = true;
     params.use_regex = false;
-    params.count_lines_mode = false;
-    params.track_positions = true;
+    params.count_lines_mode = true;
+    params.track_positions = false;
     params.max_count = SIZE_MAX;
 
-    // Execute recursive search on the test directory
+    // Execute recursive search on the test directory and capture stdout.
     printf("Testing recursive search for pattern '%s'...\n", test_pattern);
+    char output_buffer[32768];
+    int errors = -1;
+    bool capture_ok = run_recursive_search_capture(TEST_DIR_BASE, &params, 1,
+                                                   output_buffer, sizeof(output_buffer), &errors);
+    TEST_ASSERT(capture_ok, "Capture recursive directory search output");
 
-    // Reset global_match_found_flag
-    extern atomic_bool global_match_found_flag;
-    atomic_store(&global_match_found_flag, false);
-
-    int errors = search_directory_recursive(TEST_DIR_BASE, &params, 1);
-
-    // Verify results
-    printf("Recursive search completed with %d errors\n", errors);
-    bool matches_found = atomic_load(&global_match_found_flag);
-    printf("Matches found: %s\n", matches_found ? "YES" : "NO");
-
-    if (errors > 0)
+    if (capture_ok)
     {
-        printf("FAIL: Recursive search reported errors\n");
-    }
-    else if (!matches_found)
-    {
-        printf("FAIL: Recursive search didn't find expected matches\n");
-    }
-    else
-    {
-        printf("PASS: Recursive search found matches without errors\n");
+        TEST_ASSERT(errors == 0, "Recursive directory search completes without errors");
+        TEST_ASSERT(strstr(output_buffer, "file1.txt") != NULL, "Recursive search finds match in file1.txt");
+        TEST_ASSERT(strstr(output_buffer, "file3.log") == NULL, "Skips .log files from recursive search");
+        TEST_ASSERT(strstr(output_buffer, "file_level0_1.txt") != NULL ||
+                        strstr(output_buffer, "file_level0_2.txt") != NULL,
+                    "Recursive search finds match in nested directories");
+
+        // Ensure known skipped paths/extensions are not reported as matches.
+        TEST_ASSERT(strstr(output_buffer, ".git/file_in_git.txt") == NULL, "Skips .git directory files");
+        TEST_ASSERT(strstr(output_buffer, "node_modules/file_in_modules.txt") == NULL, "Skips node_modules files");
+        TEST_ASSERT(strstr(output_buffer, "minified.min.js") == NULL, "Skips .min.* files");
+        TEST_ASSERT(strstr(output_buffer, "image.jpg") == NULL, "Skips configured binary-like extensions");
     }
 
     // Cleanup
@@ -125,17 +219,16 @@ void test_binary_file_handling(void)
     params.num_patterns = 1;
     params.case_sensitive = true;
     params.use_regex = false;
-    params.count_lines_mode = false;
-    params.track_positions = true;
+    params.count_lines_mode = true;
+    params.track_positions = false;
     params.max_count = SIZE_MAX;
 
     // Execute search on the binary file
     printf("Testing search on binary file...\n");
     int result = search_file(&params, binary_file_path, 1);
 
-    // Verify results (should identify the file as binary or handle it appropriately)
-    printf("Binary file search resulted in code: %d\n", result);
-    printf("Note: We expect proper handling, either by skipping as binary or by searching safely.\n");
+    // Verify results (should complete safely and not report internal errors).
+    TEST_ASSERT(result != 2, "Binary file search completes without internal errors");
 
     // Cleanup
     free(params.patterns);
@@ -161,8 +254,11 @@ int main(void)
     test_recursive_directory_search();
     test_binary_file_handling();
 
-    printf("\nAll directory and binary file tests completed\n");
-    return 0;
+    printf("\n=== Directory Test Summary ===\n");
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_failed);
+    printf("Total tests run: %d\n", tests_passed + tests_failed);
+    return (tests_failed == 0) ? 0 : 1;
 }
 
 /* ========================================================================= */
