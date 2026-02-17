@@ -1,6 +1,6 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
@@ -19,12 +19,15 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 ## Key Features
 
 - **Multiple search algorithms**: Boyer-Moore-Horspool, KMP, Aho-Corasick for optimal performance across different pattern types
+- **Algorithm selection**: Automatic smart selection with optional `--algo` override for fine-tuning
 - **SIMD acceleration**: Uses SSE4.2, AVX2, or NEON instructions when available for blazing-fast searches
 - **Memory-mapped I/O**: Maximizes throughput when processing large files
 - **Multi-threaded search**: Automatically parallelizes searches across available CPU cores
 - **Regex support**: POSIX Extended Regular Expression searching
-- **Multiple pattern search**: Efficiently search for multiple patterns simultaneously
+- **Multiple pattern search**: Efficiently search for multiple patterns simultaneously using Aho-Corasick
 - **Recursive directory search**: Skip binary files and common non-code directories
+- **Gitignore support**: Respect `.gitignore` files during recursive search with `--gitignore`
+- **Stdin pattern input**: Read patterns from stdin with `-f -` for seamless pipeline integration
 - **Colored output**: Highlights matches for better readability
 - **Specialized algorithms**: Optimized handling for single-character and short patterns
 - **Match Limiting**: Stop searching a file after a specific number of matching lines are found.
@@ -80,6 +83,7 @@ krep [OPTIONS] -f FILE [FILE | DIRECTORY]
 krep [OPTIONS] -s PATTERN STRING_TO_SEARCH
 krep [OPTIONS] PATTERN < FILE
 cat FILE | krep [OPTIONS] PATTERN
+echo 'pattern' | krep -f - [FILE | DIRECTORY]
 ```
 
 ## Usage Examples
@@ -94,6 +98,18 @@ Search recursively:
 
 ```bash
 krep -r "function" ./project
+```
+
+Search recursively respecting `.gitignore`:
+
+```bash
+krep -r --gitignore "TODO" ./project
+```
+
+Read patterns from stdin (pipe-friendly):
+
+```bash
+echo 'pattern' | krep -f - target.txt
 ```
 
 Whole word search (matches only complete words):
@@ -114,11 +130,13 @@ cat krep.c | krep 'c'
 - `-c, --count` Count matching lines only
 - `-o, --only-matching` Print only the matched parts of lines
 - `-e PATTERN, --pattern=PATTERN` Specify pattern(s). Can be used multiple times.
-- `-f FILE, --file=FILE` Read patterns from FILE, one per line.
+- `-f FILE, --file=FILE` Read patterns from FILE, one per line. Use `-` for stdin.
 - `-m NUM, --max-count=NUM` Stop searching each file after finding NUM matching lines.
 - `-E, --extended-regexp` Use POSIX Extended Regular Expressions
 - `-F, --fixed-strings` Interpret pattern as fixed string(s) (default unless -E is used)
 - `-r, --recursive` Recursively search directories
+- `--gitignore` Respect `.gitignore` files during recursive search
+- `--algo=ALGO` Force search algorithm: `auto` (default), `bm` (Boyer-Moore), `kmp` (KMP)
 - `-t NUM, --threads=NUM` Use NUM threads for file search (default: auto)
 - `-s STRING, --string=STRING` Search in the provided STRING instead of file(s)
 - `-w, --word-regexp` Match only whole words
@@ -143,7 +161,7 @@ make bench-rg
 # optional: RUNS=7 bash test/benchmark_krep_vs_rg.sh Sherlock
 ```
 
-### krep v2.0.0 vs ripgrep (warm cache, 7 runs average)
+### krep v2.1.0 vs ripgrep (warm cache, 7 runs average)
 
 | Pattern | krep avg real (s) | ripgrep avg real (s) | Speedup |
 | --- | ---: | ---: | ---: |
@@ -165,7 +183,9 @@ Krep automatically selects the optimal search algorithm based on the pattern and
 - **memchr optimization** for single-character patterns
 - **SIMD Acceleration** (SSE4.2, AVX2, or NEON) for compatible hardware
 - **Regex Engine** for regular expression patterns
-- **Aho-Corasick** for efficient multiple pattern matching
+- **Aho-Corasick** for efficient multiple pattern matching (auto-selected with multiple `-e` patterns)
+
+Use `--algo=bm` or `--algo=kmp` to override the automatic selection for single-pattern literal searches.
 
 ### 2. Multi-threading Architecture
 

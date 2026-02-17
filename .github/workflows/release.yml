@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            artifact: krep-linux-x86_64
+          - os: macos-latest
+            arch: arm64
+            artifact: krep-macos-arm64
+          - os: macos-13
+            arch: x86_64
+            artifact: krep-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make -j
+
+      - name: Run tests
+        run: make test && make test-directory
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp krep dist/
+          cd dist
+          tar czf ${{ matrix.artifact }}.tar.gz krep
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Collect all tarballs and checksums
+          FILES=""
+          for dir in artifacts/*/; do
+            for f in "$dir"*.tar.gz "$dir"*.sha256; do
+              [ -f "$f" ] && FILES="$FILES $f"
+            done
+          done
+
+          gh release create "${{ github.ref_name }}" \
+            --title "krep ${{ github.ref_name }}" \
+            --generate-notes \
+            $FILES

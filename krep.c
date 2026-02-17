@@ -33,6 +33,7 @@
 #include <sys/types.h> // For mode_t, DIR*, struct dirent
 #include <getopt.h>    // For command-line parsing
 #include <stdatomic.h> // For atomic operations in multithreading
+#include <fnmatch.h>   // For gitignore pattern matching
 
 // Add forward declaration for is_repetitive_pattern here
 static bool is_repetitive_pattern(const char *pattern, size_t pattern_len);
@@ -79,7 +80,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "2.0.0"
+#define VERSION "2.1.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -115,6 +116,8 @@ const size_t SIMD_MAX_PATTERN_LEN = 0;
 static bool color_output_enabled KREP_UNUSED = false;
 static bool only_matching = false; // -o flag
 static bool force_no_simd = false;
+static bool use_gitignore = false;         // --gitignore flag
+static const char *algo_override = NULL;   // --algo option
 static atomic_bool global_match_found_flag = false; // Used in recursive search
 static atomic_bool madvise_warning_emitted = false;   // Suppress repeated madvise warnings
 
@@ -1135,11 +1138,13 @@ void print_usage(const char *program_name)
     printf("  -c             Count matching lines. Only a count of lines is printed.\n");
     printf("  -o             Only matching. Print only the matched parts of lines, one per line.\n");
     printf("  -e PATTERN     Specify pattern. Can be used multiple times (treated as OR for literal, combined for regex).\n");
-    printf("  -f FILE        Read patterns from FILE, one per line.\n");
+    printf("  -f FILE        Read patterns from FILE, one per line. Use '-' for stdin.\n");
     printf("  -E             Interpret PATTERN(s) as POSIX Extended Regular Expression(s).\n");
     printf("                 If multiple -e used with -E, they are combined with '|'.\n");
     printf("  -F             Interpret PATTERN(s) as fixed strings (literal). Default if not -E.\n");
     printf("  -r             Search directories recursively. Skips binary files and common dirs.\n");
+    printf("  --gitignore    Respect .gitignore files when searching recursively (-r).\n");
+    printf("  --algo=ALGO    Force search algorithm: 'auto' (default), 'bm', 'kmp'.\n");
     printf("  -t NUM         Use NUM threads for file search (default: auto-detect cores).\n");
     printf("  -s             Search in STRING_TO_SEARCH instead of FILE or DIRECTORY.\n");
     printf("  --color[=WHEN] Control color output ('always', 'never', 'auto'). Default: 'auto'.\n");
@@ -1158,7 +1163,9 @@ void print_usage(const char *program_name)
     printf("  %s -t 8 -o '[0-9]+' data.log | sort | uniq -c\n", program_name);
     printf("  %s -E \"^[Ee]rror: .*failed\" system.log\n", program_name);
     printf("  %s -r \"MyClass\" /path/to/project\n", program_name);
+    printf("  %s -r --gitignore \"TODO\" /path/to/project\n", program_name);
     printf("  %s -e Error -e Warning app.log\n", program_name); // Find lines with Error OR Warning
+    printf("  echo 'pattern' | %s -f - target.txt\n", program_name); // Read pattern from stdin
 }
 
 // Helper for case-insensitive comparison using the lookup table
@@ -1747,6 +1754,16 @@ search_func_t select_search_algorithm(const search_params_t *params)
     if (params->num_patterns > 1 && !params->use_regex)
     {
         return aho_corasick_search;
+    }
+
+    // Check for user-specified algorithm override (--algo)
+    if (algo_override != NULL && strcmp(algo_override, "auto") != 0)
+    {
+        if (strcmp(algo_override, "bm") == 0)
+            return boyer_moore_search;
+        else if (strcmp(algo_override, "kmp") == 0)
+            return kmp_search;
+        // Unknown algo name falls through to auto selection
     }
 
     // --- Single Literal Pattern ---
@@ -3097,9 +3114,175 @@ static bool is_binary_file(const char *filepath)
     return memchr(buffer, '\0', bytes_read) != NULL;
 }
 
-// Recursive directory search function
-// Note: Directory traversal itself remains serial. Parallelism happens within search_file.
-int search_directory_recursive(const char *base_dir, const search_params_t *params, int thread_count)
+// --- Gitignore Support ---
+
+// Structure to hold a single gitignore pattern
+typedef struct
+{
+    char *pattern;
+    bool negated;
+    bool dir_only;
+} gitignore_pattern_t;
+
+// Structure to hold all patterns from a .gitignore file, with parent chain
+typedef struct gitignore
+{
+    gitignore_pattern_t *entries;
+    size_t count;
+    size_t capacity;
+    struct gitignore *parent; // Parent directory's gitignore context
+} gitignore_t;
+
+// Create a new gitignore context with optional parent
+static gitignore_t *gitignore_new(gitignore_t *parent)
+{
+    gitignore_t *gi = calloc(1, sizeof(gitignore_t));
+    if (!gi)
+        return NULL;
+    gi->parent = parent;
+    gi->capacity = 16;
+    gi->entries = malloc(gi->capacity * sizeof(gitignore_pattern_t));
+    if (!gi->entries)
+    {
+        free(gi);
+        return NULL;
+    }
+    return gi;
+}
+
+// Add a pattern line from .gitignore to the context
+static void gitignore_add_pattern(gitignore_t *gi, const char *line)
+{
+    // Skip leading whitespace
+    while (*line == ' ' || *line == '\t')
+        line++;
+
+    // Skip empty lines and comments
+    if (*line == '\0' || *line == '#')
+        return;
+
+    bool negated = false;
+    if (*line == '!')
+    {
+        negated = true;
+        line++;
+    }
+
+    // Remove trailing whitespace
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == ' ' || line[len - 1] == '\t' ||
+                       line[len - 1] == '\r' || line[len - 1] == '\n'))
+        len--;
+    if (len == 0)
+        return;
+
+    // Check for directory-only pattern (trailing /)
+    bool dir_only = false;
+    if (line[len - 1] == '/')
+    {
+        dir_only = true;
+        len--;
+        if (len == 0)
+            return;
+    }
+
+    // Grow array if needed
+    if (gi->count >= gi->capacity)
+    {
+        gi->capacity *= 2;
+        gitignore_pattern_t *new_entries = realloc(gi->entries,
+                                                   gi->capacity * sizeof(gitignore_pattern_t));
+        if (!new_entries)
+            return; // Skip on allocation failure
+        gi->entries = new_entries;
+    }
+
+    // Remove leading slash (anchored to directory root)
+    if (len > 0 && line[0] == '/')
+    {
+        line++;
+        len--;
+    }
+
+    gi->entries[gi->count].pattern = strndup(line, len);
+    gi->entries[gi->count].negated = negated;
+    gi->entries[gi->count].dir_only = dir_only;
+    gi->count++;
+}
+
+// Load .gitignore from a directory; returns new context or NULL if no file found
+static gitignore_t *gitignore_load(const char *dir, gitignore_t *parent)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/.gitignore", dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return NULL;
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return NULL; // No .gitignore in this directory
+
+    gitignore_t *gi = gitignore_new(parent);
+    if (!gi)
+    {
+        fclose(f);
+        return NULL;
+    }
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f))
+    {
+        size_t llen = strlen(line);
+        while (llen > 0 && (line[llen - 1] == '\n' || line[llen - 1] == '\r'))
+            line[--llen] = '\0';
+        gitignore_add_pattern(gi, line);
+    }
+
+    fclose(f);
+    return gi;
+}
+
+// Check if a name matches gitignore patterns (walks parent chain)
+static bool gitignore_is_ignored(const gitignore_t *gi, const char *name, bool is_dir)
+{
+    if (!gi)
+        return false;
+
+    // Check parent patterns first (less specific)
+    bool ignored = gitignore_is_ignored(gi->parent, name, is_dir);
+
+    // Then check current level patterns (can override parent)
+    for (size_t i = 0; i < gi->count; i++)
+    {
+        if (gi->entries[i].dir_only && !is_dir)
+            continue;
+
+        // Match against basename using fnmatch (no FNM_PATHNAME for simple patterns)
+        if (fnmatch(gi->entries[i].pattern, name, 0) == 0)
+        {
+            ignored = !gi->entries[i].negated;
+        }
+    }
+
+    return ignored;
+}
+
+// Free a gitignore context (does NOT free parent - managed by caller)
+static void gitignore_free(gitignore_t *gi)
+{
+    if (!gi)
+        return;
+    for (size_t i = 0; i < gi->count; i++)
+    {
+        free(gi->entries[i].pattern);
+    }
+    free(gi->entries);
+    free(gi);
+}
+
+// Internal recursive directory search with gitignore support
+static int search_directory_recursive_impl(const char *base_dir, const search_params_t *params,
+                                           int thread_count, gitignore_t *parent_gi)
 {
     // Try opening the directory
     DIR *dir = opendir(base_dir);
@@ -3116,6 +3299,16 @@ int search_directory_recursive(const char *base_dir, const search_params_t *para
         }
         // Return 0 errors for permission/not found, 1 otherwise
         return (errno == EACCES || errno == ENOENT) ? 0 : 1;
+    }
+
+    // Load .gitignore for this directory if feature is enabled
+    gitignore_t *local_gi = NULL;
+    gitignore_t *effective_gi = parent_gi;
+    if (use_gitignore)
+    {
+        local_gi = gitignore_load(base_dir, parent_gi);
+        if (local_gi)
+            effective_gi = local_gi;
     }
 
     struct dirent *entry;       // Structure to hold directory entry info
@@ -3171,8 +3364,13 @@ int search_directory_recursive(const char *base_dir, const search_params_t *para
             {
                 continue; // Skip this directory
             }
+            // Check gitignore patterns
+            if (effective_gi && gitignore_is_ignored(effective_gi, entry->d_name, true))
+            {
+                continue; // Skip this directory per .gitignore
+            }
             // Otherwise, recurse into the subdirectory
-            total_errors += search_directory_recursive(path_buffer, params, thread_count);
+            total_errors += search_directory_recursive_impl(path_buffer, params, thread_count, effective_gi);
         }
         // If the entry is a regular file:
         else if (S_ISREG(entry_stat.st_mode))
@@ -3181,6 +3379,11 @@ int search_directory_recursive(const char *base_dir, const search_params_t *para
             if (should_skip_extension(entry->d_name))
             {
                 continue; // Skip this file
+            }
+            // Check gitignore patterns
+            if (effective_gi && gitignore_is_ignored(effective_gi, entry->d_name, false))
+            {
+                continue; // Skip this file per .gitignore
             }
 
             // Don't check binary files too aggressively as it might miss valid text files
@@ -3202,8 +3405,17 @@ int search_directory_recursive(const char *base_dir, const search_params_t *para
         // Ignore other file types (symlinks are not followed by lstat, sockets, pipes, etc.)
     }
 
-    closedir(dir);       // Close the directory stream
-    return total_errors; // Return the total count of errors encountered
+    closedir(dir);                          // Close the directory stream
+    if (local_gi)
+        gitignore_free(local_gi);           // Free this level's gitignore (not parent)
+    return total_errors;                    // Return the total count of errors encountered
+}
+
+// Recursive directory search function (public API)
+// Note: Directory traversal itself remains serial. Parallelism happens within search_file.
+int search_directory_recursive(const char *base_dir, const search_params_t *params, int thread_count)
+{
+    return search_directory_recursive_impl(base_dir, params, thread_count, NULL);
 }
 
 // --- Main Entry Point ---
@@ -3242,6 +3454,8 @@ int main(int argc, char *argv[])
         {"fixed-strings", no_argument, 0, 'F'},   // --fixed-strings, same as default
         {"regexp", required_argument, 0, 'e'},    // Treat -e as --regexp for consistency
         {"max-count", required_argument, 0, 'm'}, // --max-count=NUM option
+        {"gitignore", no_argument, 0, 256},       // --gitignore
+        {"algo", required_argument, 0, 257},      // --algo=ALGO
         {0, 0, 0, 0}                              // Terminator
     };
     int option_index = 0;
@@ -3328,13 +3542,23 @@ int main(int argc, char *argv[])
             }
             // STRING_TO_SEARCH (target_arg) will be the next non-option argument.
             break;
-        case 'f': // Read patterns from file
+        case 'f': // Read patterns from file (or stdin if "-")
         {
-            FILE *pattern_file = fopen(optarg, "r");
-            if (!pattern_file)
+            FILE *pattern_file;
+            bool is_stdin_pattern = (strcmp(optarg, "-") == 0);
+
+            if (is_stdin_pattern)
             {
-                fprintf(stderr, "krep: Error: Cannot open pattern file: %s\n", optarg);
-                return 2;
+                pattern_file = stdin;
+            }
+            else
+            {
+                pattern_file = fopen(optarg, "r");
+                if (!pattern_file)
+                {
+                    fprintf(stderr, "krep: Error: Cannot open pattern file: %s\n", optarg);
+                    return 2;
+                }
             }
 
             char line[MAX_PATTERN_LENGTH];
@@ -3354,7 +3578,8 @@ int main(int argc, char *argv[])
                 if (!pattern_args[num_patterns_found])
                 {
                     perror("krep: Error: Memory allocation failed for pattern");
-                    fclose(pattern_file);
+                    if (!is_stdin_pattern)
+                        fclose(pattern_file);
                     return 2;
                 }
                 pattern_lens[num_patterns_found] = strlen(pattern_args[num_patterns_found]);
@@ -3362,11 +3587,13 @@ int main(int argc, char *argv[])
                 pattern_needs_free[num_patterns_found] = true;
                 num_patterns_found++;
             }
-            fclose(pattern_file);
+            if (!is_stdin_pattern)
+                fclose(pattern_file);
 
             if (num_patterns_found == 0)
             {
-                fprintf(stderr, "krep: Error: No patterns found in file: %s\n", optarg);
+                fprintf(stderr, "krep: Error: No patterns found in %s\n",
+                        is_stdin_pattern ? "stdin" : optarg);
                 return 2;
             }
             break;
@@ -3423,6 +3650,21 @@ int main(int argc, char *argv[])
             break;
         case 'w': // Whole word
             params.whole_word = true;
+            break;
+        case 256: // --gitignore
+            use_gitignore = true;
+            break;
+        case 257: // --algo
+            if (strcmp(optarg, "auto") == 0 || strcmp(optarg, "bm") == 0 ||
+                strcmp(optarg, "kmp") == 0)
+            {
+                algo_override = optarg;
+            }
+            else
+            {
+                fprintf(stderr, "krep: Error: Unknown algorithm '%s'. Valid options: auto, bm, kmp\n", optarg);
+                return 2;
+            }
             break;
         case '?': // Unknown option or missing argument from getopt
         default:  // Should not happen
