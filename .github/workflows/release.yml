@@ -20,9 +20,6 @@ jobs:
           - os: macos-latest
             arch: arm64
             artifact: krep-macos-arm64
-          - os: macos-13
-            arch: x86_64
-            artifact: krep-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +67,9 @@ jobs:
             done
           done
 
+          # Create release if it doesn't exist, then upload assets
           gh release create "${{ github.ref_name }}" \
             --title "krep ${{ github.ref_name }}" \
             --generate-notes \
-            $FILES
+            $FILES 2>/dev/null \
+          || gh release upload "${{ github.ref_name }}" $FILES --clobber
