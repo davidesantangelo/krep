@@ -1,6 +1,6 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.0-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
@@ -29,8 +29,15 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 - **Gitignore support**: Respect `.gitignore` files during recursive search with `--gitignore`
 - **Stdin pattern input**: Read patterns from stdin with `-f -` for seamless pipeline integration
 - **Colored output**: Highlights matches for better readability
+- **UI/UX refresh (v2.2)**: New terminal color palette, clearer `-o` line index styling, and a redesigned help screen
 - **Specialized algorithms**: Optimized handling for single-character and short patterns
 - **Match Limiting**: Stop searching a file after a specific number of matching lines are found.
+
+## What's New in v2.2.0
+
+- Refined terminal-first UI with a cleaner, more legible color theme
+- Better visual hierarchy in `-o` mode (filename, line index, match highlight)
+- Improved `--help` layout with grouped sections and clearer scanning
 
 ## Installation
 
@@ -161,7 +168,7 @@ make bench-rg
 # optional: RUNS=7 bash test/benchmark_krep_vs_rg.sh Sherlock
 ```
 
-### krep v2.1.0 vs ripgrep (warm cache, 7 runs average)
+### krep v2.1.0 vs ripgrep (warm cache, 7 runs average baseline)
 
 | Pattern | krep avg real (s) | ripgrep avg real (s) | Speedup |
 | --- | ---: | ---: | ---: |

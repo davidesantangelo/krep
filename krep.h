@@ -32,10 +32,17 @@ typedef struct ac_trie ac_trie_t;
 /* --- ANSI Color Codes --- */
 // Define colors consistently
 #define KREP_COLOR_RESET "\033[0m"
-#define KREP_COLOR_FILENAME "\033[1;35m"  // Magenta
-#define KREP_COLOR_SEPARATOR "\033[1;90m" // Bright Black (Gray)
-#define KREP_COLOR_MATCH "\033[1;31m"     // Bright Red
-#define KREP_COLOR_TEXT "\033[0m"         // Default terminal text color
+#define KREP_COLOR_FILENAME "\033[1;38;5;81m"   // Bright cyan
+#define KREP_COLOR_SEPARATOR "\033[38;5;244m"   // Muted gray
+#define KREP_COLOR_LINE_NUMBER "\033[1;38;5;111m" // Soft mint
+#define KREP_COLOR_MATCH "\033[1;38;5;222m"     // Warm amber
+#define KREP_COLOR_TEXT "\033[38;5;252m"        // Soft white
+
+/* --- Help UI Colors --- */
+#define KREP_COLOR_HELP_TITLE "\033[1;38;5;81m"
+#define KREP_COLOR_HELP_SECTION "\033[1;38;5;222m"
+#define KREP_COLOR_HELP_OPTION "\033[1;38;5;117m"
+#define KREP_COLOR_HELP_MUTED "\033[38;5;244m"
 
 /* --- Match tracking structure --- */
 // Define match_position_t BEFORE match_result_t

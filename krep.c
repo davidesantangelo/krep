@@ -80,7 +80,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "2.1.0"
+#define VERSION "2.2.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -501,11 +501,13 @@ size_t print_matching_items(const char *filename, const char *text, size_t text_
     const char *color_filename = KREP_COLOR_FILENAME;
     const char *color_reset = KREP_COLOR_RESET;
     const char *color_separator = KREP_COLOR_SEPARATOR;
+    const char *color_line_number = KREP_COLOR_LINE_NUMBER;
     const char *color_text = KREP_COLOR_TEXT;
     const char *color_match = KREP_COLOR_MATCH;
 
     // Precompute lengths to avoid repeated strlen calls
     size_t len_color_reset = color_output_enabled ? strlen(color_reset) : 0;
+    size_t len_color_line_number = color_output_enabled ? strlen(color_line_number) : 0;
     size_t len_color_text = color_output_enabled ? strlen(color_text) : 0;
     size_t len_color_match = color_output_enabled ? strlen(color_match) : 0;
 
@@ -688,7 +690,7 @@ size_t print_matching_items(const char *filename, const char *text, size_t text_
             size_t required_estimate = filename_prefix_len + lineno_len + len + 1; // +1 for newline
             if (color_output_enabled)
             {
-                required_estimate += len_color_match + len_color_reset;
+                required_estimate += len_color_line_number + len_color_match + (len_color_reset * 2);
             }
 
             // Flush the batch buffer to stdout if the new entry won't fit (use estimate)
@@ -714,7 +716,15 @@ size_t print_matching_items(const char *filename, const char *text, size_t text_
             }
 
             // 2. Copy line number
+            if (color_output_enabled)
+            {
+                safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, color_line_number, len_color_line_number);
+            }
             safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, lineno_buffer, lineno_len);
+            if (color_output_enabled)
+            {
+                safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, color_reset, len_color_reset);
+            }
 
             // 3. Start color for match (if enabled)
             if (color_output_enabled)
@@ -1126,46 +1136,62 @@ double get_time(void)
 // Print usage information
 void print_usage(const char *program_name)
 {
-    printf("krep v%s - A high-performance string search utility\n\n", VERSION);
-    printf("Usage: %s [OPTIONS] PATTERN [FILE | DIRECTORY]\n", program_name);
-    printf("   or: %s [OPTIONS] -e PATTERN [-e PATTERN...] [FILE | DIRECTORY]\n", program_name);
-    printf("   or: %s [OPTIONS] -f FILE [FILE | DIRECTORY]\n", program_name);
-    printf("   or: %s [OPTIONS] -s PATTERN STRING_TO_SEARCH\n", program_name);
-    printf("   or: %s [OPTIONS] PATTERN < FILE\n", program_name);
-    printf("   or: cat FILE | %s [OPTIONS] PATTERN\n\n", program_name);
-    printf("OPTIONS:\n");
-    printf("  -i             Perform case-insensitive matching.\n");
-    printf("  -c             Count matching lines. Only a count of lines is printed.\n");
-    printf("  -o             Only matching. Print only the matched parts of lines, one per line.\n");
-    printf("  -e PATTERN     Specify pattern. Can be used multiple times (treated as OR for literal, combined for regex).\n");
-    printf("  -f FILE        Read patterns from FILE, one per line. Use '-' for stdin.\n");
-    printf("  -E             Interpret PATTERN(s) as POSIX Extended Regular Expression(s).\n");
-    printf("                 If multiple -e used with -E, they are combined with '|'.\n");
-    printf("  -F             Interpret PATTERN(s) as fixed strings (literal). Default if not -E.\n");
-    printf("  -r             Search directories recursively. Skips binary files and common dirs.\n");
-    printf("  --gitignore    Respect .gitignore files when searching recursively (-r).\n");
-    printf("  --algo=ALGO    Force search algorithm: 'auto' (default), 'bm', 'kmp'.\n");
-    printf("  -t NUM         Use NUM threads for file search (default: auto-detect cores).\n");
-    printf("  -s             Search in STRING_TO_SEARCH instead of FILE or DIRECTORY.\n");
-    printf("  --color[=WHEN] Control color output ('always', 'never', 'auto'). Default: 'auto'.\n");
-    printf("  --no-simd      Explicitly disable SIMD acceleration.\n");
-    printf("  -v             Show version information and exit.\n");
-    printf("  -h, --help     Show this help message and exit.\n");
-    printf("  -m NUM         Stop reading a file after NUM matching lines.\n");
-    printf("  -w             Select only matches that form whole words.\n\n");
-    printf("EXIT STATUS:\n");
-    printf("  0 if matches were found,\n");
-    printf("  1 if no matches were found,\n");
-    printf("  2 if an error occurred.\n\n");
-    printf("EXAMPLES:\n");
+    bool style = isatty(STDOUT_FILENO);
+    const char *title = style ? KREP_COLOR_HELP_TITLE : "";
+    const char *section = style ? KREP_COLOR_HELP_SECTION : "";
+    const char *option = style ? KREP_COLOR_HELP_OPTION : "";
+    const char *muted = style ? KREP_COLOR_HELP_MUTED : "";
+    const char *reset = style ? KREP_COLOR_RESET : "";
+
+    printf("%skrep v%s%s\n", title, VERSION, reset);
+    printf("%sFast search with polished terminal output.%s\n\n", muted, reset);
+
+    printf("%sUsage%s\n", section, reset);
+    printf("  %s [OPTIONS] PATTERN [FILE | DIRECTORY]\n", program_name);
+    printf("  %s [OPTIONS] -e PATTERN [-e PATTERN...] [FILE | DIRECTORY]\n", program_name);
+    printf("  %s [OPTIONS] -f FILE [FILE | DIRECTORY]\n", program_name);
+    printf("  %s [OPTIONS] -s PATTERN STRING_TO_SEARCH\n", program_name);
+    printf("  %s [OPTIONS] PATTERN < FILE\n", program_name);
+    printf("  cat FILE | %s [OPTIONS] PATTERN\n\n", program_name);
+
+    printf("%sSearch%s\n", section, reset);
+    printf("  %s-i%s             Perform case-insensitive matching.\n", option, reset);
+    printf("  %s-e PATTERN%s     Specify pattern. Reusable for multiple patterns.\n", option, reset);
+    printf("  %s-f FILE%s        Read patterns from FILE (use '-' for stdin).\n", option, reset);
+    printf("  %s-E%s             Use POSIX Extended Regular Expressions.\n", option, reset);
+    printf("  %s-F%s             Use fixed strings (default unless -E).\n", option, reset);
+    printf("  %s-w%s             Match whole words only.\n\n", option, reset);
+
+    printf("%sScope & Performance%s\n", section, reset);
+    printf("  %s-r%s             Search directories recursively.\n", option, reset);
+    printf("  %s--gitignore%s    Respect .gitignore when used with -r.\n", option, reset);
+    printf("  %s--algo=ALGO%s    Force algorithm: auto (default), bm, kmp.\n", option, reset);
+    printf("  %s-t NUM%s         Set thread count (default: auto).\n", option, reset);
+    printf("  %s--no-simd%s      Disable SIMD acceleration.\n\n", option, reset);
+
+    printf("%sOutput & UX%s\n", section, reset);
+    printf("  %s-o%s             Print only matching parts, one per line.\n", option, reset);
+    printf("  %s-c%s             Print only match counts.\n", option, reset);
+    printf("  %s-m NUM%s         Stop after NUM matching lines per file.\n", option, reset);
+    printf("  %s-s%s             Search in STRING_TO_SEARCH.\n", option, reset);
+    printf("  %s--color[=WHEN]%s Color mode: always, never, auto (default).\n", option, reset);
+    printf("  %s-v%s             Show version information.\n", option, reset);
+    printf("  %s-h, --help%s     Show this help page.\n\n", option, reset);
+
+    printf("%sExit Status%s\n", section, reset);
+    printf("  0  match found\n");
+    printf("  1  no match found\n");
+    printf("  2  error\n\n");
+
+    printf("%sExamples%s\n", section, reset);
     printf("  %s \"search term\" input.log\n", program_name);
     printf("  %s -i -c ERROR large_log.txt\n", program_name);
     printf("  %s -t 8 -o '[0-9]+' data.log | sort | uniq -c\n", program_name);
     printf("  %s -E \"^[Ee]rror: .*failed\" system.log\n", program_name);
     printf("  %s -r \"MyClass\" /path/to/project\n", program_name);
     printf("  %s -r --gitignore \"TODO\" /path/to/project\n", program_name);
-    printf("  %s -e Error -e Warning app.log\n", program_name); // Find lines with Error OR Warning
-    printf("  echo 'pattern' | %s -f - target.txt\n", program_name); // Read pattern from stdin
+    printf("  %s -e Error -e Warning app.log\n", program_name);
+    printf("  echo 'pattern' | %s -f - target.txt\n", program_name);
 }
 
 // Helper for case-insensitive comparison using the lookup table
