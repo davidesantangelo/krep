@@ -35,9 +35,13 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 
 ## Recent Improvements
 
-- Refined terminal-first UI with a cleaner, more legible color theme
-- Better visual hierarchy in `-o` mode (filename, line index, match highlight)
-- Improved `--help` layout with grouped sections and clearer scanning
+- **Shift-Or / BNDM** bit-parallel search for lightning-fast short pattern matching (2–8 bytes)
+- **Two-Way** string matching (O(n+m) worst-case) as the new default scalar fallback
+- **NEON 32-byte processing** on ARM64/Apple Silicon for doubled throughput
+- **Fast word-char lookup table** replacing `isalnum()` in hot paths
+- **MADV_HUGEPAGE** support on Linux for reduced TLB pressure on large files
+- **Double-distance prefetching** for better cache line utilization
+- New `--algo bndm` and `--algo two` options for manual algorithm selection
 
 ## Installation
 
@@ -175,7 +179,7 @@ make bench-rg
 | `the` | 0.132857 | 0.318571 | 4.848571 | 2.40x | 36.49x |
 | `Sherlock` | 0.031429 | 0.080000 | 2.777143 | 2.55x | 88.36x |
 
-_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 2.3.0 improves the hot `-c -F` path by preferring the short literal scalar fast path for 2-3 byte patterns and by splitting multi-threaded count workloads on newline boundaries, eliminating boundary over-count risk while reducing overlap overhead. Results vary by CPU, storage and cache state._
+_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 2.4.0 adds BNDM/Shift-Or for 2–8 byte patterns, Two-Way O(n+m) fallback, and 32-byte NEON processing for even higher throughput. Results vary by CPU, storage and cache state._
 
 ## How Krep Works
 
