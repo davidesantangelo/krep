@@ -1,7 +1,7 @@
 /* krep - A high-performance string search utility
  *
  * Author: Davide Santangelo
- * Year: 2025
+ * Year: 2025-2026
  *
  */
 
@@ -80,7 +80,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "2.3.0"
+#define VERSION "2.4.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -88,6 +88,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define MAX_PATTERN_FILE_LINE_LEN 2048 // Max length for a pattern line read from file
 #define CACHE_LINE_SIZE 64             // Modern CPU cache line size
 #define PREFETCH_DISTANCE 512          // Bytes ahead to prefetch
+#define PREFETCH_DISTANCE_FAR 1024     // Double-distance prefetch for streaming access
 
 // Compiler hints for better optimization
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -124,12 +125,22 @@ static atomic_bool madvise_warning_emitted = false;   // Suppress repeated madvi
 // Global lookup table for fast lowercasing
 unsigned char lower_table[256]; // Remove static
 
-// Initialize the lower_table at program start
-static void __attribute__((constructor)) init_lower_table(void)
+// Global fast word-character classification table.
+// Bit 0: word char (alnum or '_'), Bit 1: space/newline.
+unsigned char word_char_table[256];
+
+// Initialize the lookup tables at program start
+static void __attribute__((constructor)) init_lookup_tables(void)
 {
     for (int i = 0; i < 256; i++)
     {
         lower_table[i] = tolower(i);
+        unsigned char flags = 0;
+        if (isalnum(i) || i == '_')
+            flags |= 1;      // bit 0: word char
+        if (i == ' ' || i == '\t' || i == '\n' || i == '\r')
+            flags |= 2;      // bit 1: whitespace (future use)
+        word_char_table[i] = flags;
     }
 }
 
@@ -1179,7 +1190,7 @@ void print_usage(const char *program_name)
     printf("%sScope & Performance%s\n", section, reset);
     printf("  %s-r%s             Search directories recursively.\n", option, reset);
     printf("  %s--gitignore%s    Respect .gitignore when used with -r.\n", option, reset);
-    printf("  %s--algo=ALGO%s    Force algorithm: auto (default), bm, kmp.\n", option, reset);
+    printf("  %s--algo=ALGO%s    Force algorithm: auto (default), bm, kmp, bndm, two.\n", option, reset);
     printf("  %s-t NUM%s         Set thread count (default: auto).\n", option, reset);
     printf("  %s--no-simd%s      Disable SIMD acceleration.\n\n", option, reset);
 
@@ -1592,6 +1603,356 @@ uint64_t regex_search(const search_params_t *params,
     return count;
 }
 
+// ============================================================
+// Shift-Or / BNDM Algorithm (Bit-parallel string matching)
+//
+// For patterns 1–8 bytes this uses a single 64-bit word (BNDM).
+// For patterns 9–64 bytes it falls back to the Two-Way algorithm
+// since multi-word bit-parallel on general-purpose CPUs has too
+// much overhead.
+//
+// Reference: "A new approach to text searching" by
+//   Baeza-Yates & Gonnet (CACM 1992); BNDM variant by
+//   Navarro & Raffinot (ACM Computing Surveys 2002).
+// ============================================================
+
+// For patterns <=8 bytes on 64-bit: single-word BNDM.
+static HOT_FUNCTION uint64_t
+shift_or_search_small(const search_params_t *params,
+                      const char *text_start,
+                      size_t text_len,
+                      match_result_t *result)
+{
+    const unsigned char *pattern = (const unsigned char *)params->pattern;
+    const size_t m = params->pattern_len;
+    const bool case_sensitive = params->case_sensitive;
+    const bool count_lines_mode = params->count_lines_mode;
+    const bool track_positions = params->track_positions;
+    const size_t max_count = params->max_count;
+
+    // Precompute 256-entry mask: mask[c] has bit i set iff pattern[m-1-i] == c
+    uint64_t mask[256] = {0};
+    for (size_t j = 0; j < m; j++) {
+        unsigned char ch = pattern[m - 1 - j];
+        mask[ch] |= ((uint64_t)1) << j;
+        if (!case_sensitive) {
+            mask[lower_table[ch]] |= ((uint64_t)1) << j;
+            // Also set the other case if applicable
+            unsigned char up = toupper(ch);
+            if (up != ch)
+                mask[up] |= ((uint64_t)1) << j;
+        }
+    }
+    // For case-insensitive, ensure all variants are covered
+    if (!case_sensitive) {
+        for (size_t j = 0; j < m; j++) {
+            unsigned char ch = pattern[m - 1 - j];
+            unsigned char lo = lower_table[ch];
+            if (lo != ch)
+                mask[lo] |= ((uint64_t)1) << j;
+        }
+    }
+
+    const uint64_t match_mask = ((uint64_t)1) << (m - 1);
+    const unsigned char *text = (const unsigned char *)text_start;
+    size_t last_counted_line_start = SIZE_MAX;
+    uint64_t current_count = 0;
+    size_t pos = 0;
+
+    while (pos + m <= text_len) {
+        // Prefetch ahead
+        if (LIKELY(pos + PREFETCH_DISTANCE < text_len))
+            __builtin_prefetch(text + pos + PREFETCH_DISTANCE, 0, 0);
+
+        size_t j = m;
+        size_t last = m;
+        uint64_t state = ~(uint64_t)0;
+
+        // Backward scan within the window
+        while (state != 0) {
+            j--;
+            unsigned char ch = text[pos + j];
+            state &= mask[ch];
+            if ((state & match_mask) != 0) {
+                // Possible match ending at the right edge
+                if (j > 0) {
+                    last = j;  // Remember the last matching prefix position
+                } else {
+                    // Confirmed match
+                    size_t match_start = pos;
+
+                    // Whole word check
+                    if (params->whole_word &&
+                        !is_whole_word_match(text_start, text_len,
+                                            match_start, match_start + m)) {
+                        break; // out of state loop
+                    }
+
+                    if (count_lines_mode) {
+                        size_t line_start = find_line_start(text_start, text_len, match_start);
+                        if (line_start != last_counted_line_start) {
+                            if (++current_count >= max_count)
+                                return current_count;
+                            last_counted_line_start = line_start;
+                            // Skip to end of this line
+                            size_t line_end = find_line_end(text_start, text_len, line_start);
+                            pos = (line_end < text_len) ? line_end + 1 : text_len;
+                            goto next_window;
+                        }
+                    } else {
+                        if (++current_count >= max_count) {
+                            if (track_positions && result)
+                                match_result_add(result, match_start, match_start + m);
+                            return current_count;
+                        }
+                        if (track_positions && result)
+                            match_result_add(result, match_start, match_start + m);
+                    }
+                    // For non-overlapping matches, advance past this one
+                    pos += (only_matching ? m : 1);
+                    goto next_window;
+                }
+            }
+            state <<= 1;
+        }
+
+        // No match in this window; skip by `last` (BNDM skip)
+        pos += last;
+    next_window:;
+    }
+
+    return current_count;
+}
+
+// Public entry point: dispatches to the right implementation.
+uint64_t shift_or_search(const search_params_t *params,
+                         const char *text_start,
+                         size_t text_len,
+                         match_result_t *result)
+{
+    if (UNLIKELY(params->max_count == 0 && (params->count_lines_mode || params->track_positions)))
+        return 0;
+    if (UNLIKELY(params->pattern_len == 0 || text_len < params->pattern_len))
+        return 0;
+
+    // Use single-word BNDM for patterns 1–8 bytes
+    if (params->pattern_len <= 8) {
+        return shift_or_search_small(params, text_start, text_len, result);
+    }
+    // For longer patterns, fall back to Boyer-Moore which
+    // handles bad-character shifts better with a 256-entry table.
+    return boyer_moore_search(params, text_start, text_len, result);
+}
+
+// ============================================================
+// Two-Way String Matching Algorithm
+//
+// Crochemore & Perrin (1991).  This is the algorithm used by
+// glibc's memmem/strstr.  It offers O(n+m) worst-case time
+// while still performing very well on average.
+//
+// The key idea is to factor the pattern into two parts (l, r)
+// around a "critical position" such that every occurrence of
+// the pattern must align with the period.  We then search
+// forward for the right part, then verify the left part.
+// ============================================================
+
+// Compute the maximal suffix for Two-Way factorization.
+// Returns the critical position |p|.
+static size_t two_way_maximal_suffix(const unsigned char *needle, size_t n,
+                                     bool case_sensitive,
+                                     size_t *period_out)
+{
+    size_t i, j, k, p;
+    unsigned char a, b;
+
+    // "Tuned" comparison: case-insensitive uses lower_table.
+    #define TW_CMP(a, b) (case_sensitive ? ((a) == (b)) : (lower_table[(a)] == lower_table[(b)]))
+
+    i = 0; j = 1; k = 1; p = 1;
+    while (j + k < n) {
+        a = needle[j + k];
+        b = needle[i + k];
+        if (TW_CMP(a, b)) {
+            if (k == p) {
+                j += p;
+                k = 1;
+            } else {
+                ++k;
+            }
+        } else if (a > b) {
+            j += k;
+            k = 1;
+            p = j - i;
+        } else {
+            i = j;
+            j++;
+            k = 1;
+            p = 1;
+        }
+    }
+    *period_out = p;
+    return i;
+}
+
+// Compute the critical factorization and period for Two-Way.
+// Stores the split point in *split and the period in *period.
+static void two_way_factorization(const unsigned char *needle, size_t n,
+                                  bool case_sensitive,
+                                  size_t *split, size_t *period)
+{
+    // Compute maximal suffix for the regular order and the reversed order.
+    // Take the larger suffix, which gives better factorisation.
+    size_t p1, p2;
+    size_t s1 = two_way_maximal_suffix(needle, n, case_sensitive, &p1);
+
+    // Reverse byte order for the second maximal suffix computation.
+    unsigned char rev[MAX_PATTERN_LENGTH];
+    for (size_t i = 0; i < n; i++)
+        rev[i] = needle[n - 1 - i];
+    size_t s2 = two_way_maximal_suffix(rev, n, case_sensitive, &p2);
+    // Convert reversed position back
+    s2 = (n - 1 - s2) - (p2 - 1);
+
+    if (s1 >= s2) {
+        *split = s1;
+        *period = p1;
+    } else {
+        *split = s2;
+        *period = p2;
+    }
+}
+
+HOT_FUNCTION
+uint64_t two_way_search(const search_params_t *params,
+                        const char *text_start,
+                        size_t text_len,
+                        match_result_t *result)
+{
+    if (UNLIKELY(params->max_count == 0 && (params->count_lines_mode || params->track_positions)))
+        return 0;
+
+    const unsigned char *needle = (const unsigned char *)params->pattern;
+    const size_t m = params->pattern_len;
+    const bool case_sensitive = params->case_sensitive;
+    const bool count_lines_mode = params->count_lines_mode;
+    const bool track_positions = params->track_positions;
+    const size_t max_count = params->max_count;
+
+    if (UNLIKELY(m == 0 || text_len < m))
+        return 0;
+
+    // For single-char patterns, memchr is faster
+    if (m == 1)
+        return memchr_search(params, text_start, text_len, result);
+
+    // Compute critical factorization
+    size_t split, period;
+    two_way_factorization(needle, m, case_sensitive, &split, &period);
+    size_t right_len = m - split;
+
+    const unsigned char *haystack = (const unsigned char *)text_start;
+    size_t last_counted_line_start = SIZE_MAX;
+    uint64_t current_count = 0;
+
+    // Macros for character comparison (hoisted for speed).
+    // memcmp-based comparison for the left part is usually well-optimised.
+    #define TW_EQ(a, b, n) \
+        (case_sensitive ? (memcmp((a), (b), (n)) == 0) \
+                        : memory_equals_case_insensitive((const unsigned char *)(a), (const unsigned char *)(b), (n)))
+
+    size_t pos = 0;
+    size_t mem_len = text_len - m + 1;
+
+    if (split == 0) {
+        // Degenerate case: right part is entire pattern.
+        // Fall back to straightforward search with period skip.
+        while (pos < mem_len) {
+            if (LIKELY(pos + PREFETCH_DISTANCE < text_len))
+                __builtin_prefetch(haystack + pos + PREFETCH_DISTANCE, 0, 0);
+
+            if (TW_EQ(haystack + pos, needle, m)) {
+                size_t match_start = pos;
+
+                if (!params->whole_word ||
+                    is_whole_word_match(text_start, text_len, match_start, match_start + m)) {
+
+                    if (count_lines_mode) {
+                        size_t line_start = find_line_start(text_start, text_len, match_start);
+                        if (line_start != last_counted_line_start) {
+                            if (++current_count >= max_count) return current_count;
+                            last_counted_line_start = line_start;
+                            size_t line_end = find_line_end(text_start, text_len, line_start);
+                            pos = (line_end < text_len) ? line_end + 1 : text_len;
+                            continue;
+                        }
+                    } else {
+                        if (++current_count >= max_count) {
+                            if (track_positions && result)
+                                match_result_add(result, match_start, match_start + m);
+                            return current_count;
+                        }
+                        if (track_positions && result)
+                            match_result_add(result, match_start, match_start + m);
+                    }
+                }
+                pos += (only_matching ? m : 1);
+            } else {
+                pos++;
+            }
+        }
+        return current_count;
+    }
+
+    // Main Two-Way loop: search for the right part (suffix),
+    // then verify the left part (prefix).
+    while (pos <= text_len - m) {
+        if (LIKELY(pos + PREFETCH_DISTANCE < text_len))
+            __builtin_prefetch(haystack + pos + PREFETCH_DISTANCE, 0, 0);
+
+        // Scan for the right part
+        size_t k = split;
+        // Check if right part matches at (pos + k)
+        if (TW_EQ(haystack + pos + k, needle + k, right_len)) {
+            // Right part matched; now verify the left part
+            if (TW_EQ(haystack + pos, needle, k)) {
+                // Full match verified
+                size_t match_start = pos;
+
+                if (!params->whole_word ||
+                    is_whole_word_match(text_start, text_len, match_start, match_start + m)) {
+
+                    if (count_lines_mode) {
+                        size_t line_start = find_line_start(text_start, text_len, match_start);
+                        if (line_start != last_counted_line_start) {
+                            if (++current_count >= max_count) return current_count;
+                            last_counted_line_start = line_start;
+                            size_t line_end = find_line_end(text_start, text_len, line_start);
+                            pos = (line_end < text_len) ? line_end + 1 : text_len;
+                            continue;
+                        }
+                    } else {
+                        if (++current_count >= max_count) {
+                            if (track_positions && result)
+                                match_result_add(result, match_start, match_start + m);
+                            return current_count;
+                        }
+                        if (track_positions && result)
+                            match_result_add(result, match_start, match_start + m);
+                    }
+                }
+                pos += (only_matching ? m : period);
+            } else {
+                pos++;
+            }
+        } else {
+            pos++;
+        }
+    }
+
+    return current_count;
+}
+
 // --- Knuth-Morris-Pratt (KMP) Algorithm ---
 
 // Compute the Longest Proper Prefix which is also Suffix (LPS) array
@@ -1803,6 +2164,10 @@ search_func_t select_search_algorithm(const search_params_t *params)
             return boyer_moore_search;
         else if (strcmp(algo_override, "kmp") == 0)
             return kmp_search;
+        else if (strcmp(algo_override, "bndm") == 0)
+            return shift_or_search;
+        else if (strcmp(algo_override, "two") == 0)
+            return two_way_search;
         // Unknown algo name falls through to auto selection
     }
 
@@ -1811,84 +2176,71 @@ search_func_t select_search_algorithm(const search_params_t *params)
     // Check if SIMD can be used:
     bool can_use_simd = !force_no_simd && SIMD_MAX_PATTERN_LEN > 0 && params->pattern_len <= SIMD_MAX_PATTERN_LEN;
 
-    // First, handle very short patterns (1-3 characters) specially
-    const size_t SHORT_PATTERN_THRESH = 4; // Patterns of length 1-3 use specialized algorithms
-
+    // 1) Single character: ultra-fast memchr approach
     if (params->pattern_len == 1)
     {
-        // For single-character patterns, use ultra-fast memchr approach
         return memchr_search;
     }
-    else if (params->pattern_len < SHORT_PATTERN_THRESH)
-    {
-        // For line-counting workloads on very short literals, the scalar memchr-based
-        // implementation is often faster than the SIMD path because it can skip an
-        // entire matching line with less setup overhead.
-        if (params->count_lines_mode)
-        {
-            return memchr_short_search;
-        }
 
-        // For 2-3 character patterns, use our specialized short pattern search
-        // SIMD might still be better for case-sensitive search on supported platforms
-        if (can_use_simd && params->case_sensitive)
-        {
-// Use SIMD for short case-sensitive patterns if available
-#if KREP_USE_AVX512
-            return simd_avx512_search;
-#elif KREP_USE_AVX2
-            return simd_avx2_search;
-#elif KREP_USE_SSE42
-            return simd_sse42_search;
-#elif KREP_USE_NEON
-            return neon_search;
-#else
+    // 2) BNDM (Shift-Or) for patterns 2–8 bytes.
+    //    Bit-parallel search is exceptionally fast on modern CPUs and
+    //    often beats both BMH and SIMD for very short patterns.
+    if (params->pattern_len >= 2 && params->pattern_len <= 8)
+    {
+        // For line-counting workloads on very short literals (2-3 bytes),
+        // the scalar memchr-based path can skip an entire line with less
+        // overhead than building bit-masks.
+        if (params->pattern_len <= 3 && params->count_lines_mode)
             return memchr_short_search;
-#endif
-        }
-        else
-        {
-            // Use our specialized function for short patterns (handles case-insensitive well)
+
+        // For case-insensitive patterns 2–3 bytes, memchr_short_search
+        // has a well-tuned hand-rolled inner loop.
+        if (params->pattern_len <= 3 && !params->case_sensitive)
             return memchr_short_search;
-        }
+
+        // Otherwise: BNDM (Shift-Or) for 2–8 byte case-sensitive,
+        // or case-insensitive patterns of length 4–8.
+        return shift_or_search;
     }
 
-    // For patterns 4 characters or longer, follow existing logic
-    if (can_use_simd)
+    // 3) For patterns 9+ bytes, prefer SIMD when available
+    if (can_use_simd && params->case_sensitive)
     {
 #if KREP_USE_AVX512
-        // AVX-512 supports patterns up to 64 bytes (case-sensitive only)
-        if (params->pattern_len <= 64 && params->case_sensitive)
+        if (params->pattern_len <= 64)
             return simd_avx512_search;
 #endif
 #if KREP_USE_AVX2
-        // AVX2 supports case-insensitive up to 32 bytes
         if (params->pattern_len <= 32)
             return simd_avx2_search;
 #endif
 #if KREP_USE_SSE42
-        // SSE4.2 only supports case-sensitive up to 16 bytes
-        if (params->pattern_len <= 16 && params->case_sensitive)
+        if (params->pattern_len <= 16)
             return simd_sse42_search;
 #endif
 #if KREP_USE_NEON
-        // NEON supports case-sensitive for any length (using first-byte filter)
-        if (params->case_sensitive)
-            return neon_search;
+        return neon_search;
+#endif
+    } else if (can_use_simd && !params->case_sensitive) {
+#if KREP_USE_AVX2
+        if (params->pattern_len <= 32)
+            return simd_avx2_search;
 #endif
     }
 
-    // Fallback to scalar algorithms for longer patterns
-    const size_t KMP_THRESH = 8; // Increased threshold - KMP becomes more efficient for certain patterns
+    // 4) Two-Way algorithm for the general scalar fallback.
+    //    It provides O(n+m) worst-case performance vs BMH's O(n*m),
+    //    and matches or exceeds BMH on modern CPUs for most workloads.
+    //    Fall back to BMH only when pattern is very repetitive and
+    //    Two-Way's period-based skip might be suboptimal.
+    if (is_repetitive_pattern(params->pattern, params->pattern_len) &&
+        params->pattern_len < 12)
+    {
+        return kmp_search;
+    }
 
-    if (params->pattern_len < KMP_THRESH && is_repetitive_pattern(params->pattern, params->pattern_len))
-    {
-        return kmp_search; // KMP is better for repetitive patterns
-    }
-    else
-    {
-        return boyer_moore_search; // Generally best for most pattern types
-    }
+    // Default: Two-Way offers excellent average & worst-case performance.
+    return two_way_search;
 }
 
 // Helper function to detect repetitive patterns where KMP might perform better
@@ -1997,6 +2349,10 @@ const char *get_algorithm_name(search_func_t func)
         return "memchr";
     else if (func == memchr_short_search)
         return "memchr-short";
+    else if (func == shift_or_search)
+        return "Shift-Or";
+    else if (func == two_way_search)
+        return "Two-Way";
 #if KREP_USE_SSE42
     else if (func == simd_sse42_search)
         return "SSE4.2";
@@ -2742,6 +3098,15 @@ int search_file(const search_params_t *params, const char *filename, int request
             }
             // Continue execution since this is just an optimization
         }
+
+        // Request transparent huge pages for large files on Linux
+        // (MADV_HUGEPAGE is Linux-only, harmless if unsupported)
+#ifdef MADV_HUGEPAGE
+        if (file_size >= LARGE_FILE_THRESHOLD)
+        {
+            madvise(file_data, file_size, MADV_HUGEPAGE);
+        }
+#endif
     }
 
     close(fd); // Close file descriptor after mmap
@@ -3734,13 +4099,14 @@ int main(int argc, char *argv[])
             break;
         case 257: // --algo
             if (strcmp(optarg, "auto") == 0 || strcmp(optarg, "bm") == 0 ||
-                strcmp(optarg, "kmp") == 0)
+                strcmp(optarg, "kmp") == 0 || strcmp(optarg, "bndm") == 0 ||
+                strcmp(optarg, "two") == 0)
             {
                 algo_override = optarg;
             }
             else
             {
-                fprintf(stderr, "krep: Error: Unknown algorithm '%s'. Valid options: auto, bm, kmp\n", optarg);
+                fprintf(stderr, "krep: Error: Unknown algorithm '%s'. Valid options: auto, bm, kmp, bndm, two\n", optarg);
                 return 2;
             }
             break;
@@ -4555,6 +4921,10 @@ uint64_t memchr_short_search(const search_params_t *params,
 }
 
 #ifdef __ARM_NEON
+// NEON search function — optimised for 32-byte wide processing.
+// Handles case-sensitive patterns of any length.
+// Uses 2x 16-byte loads per iteration with fast mask extraction via
+// vshrn/vmovn instead of store-to-memory.
 uint64_t neon_search(const search_params_t *params,
                      const char *text_start,
                      size_t text_len,
@@ -4582,45 +4952,61 @@ uint64_t neon_search(const search_params_t *params,
     const char *current_pos = text_start;
     size_t remaining_len = text_len;
 
-    // Process in 16-byte chunks
-    while (remaining_len >= 16)
+    // Process in 32-byte (2×NEON) chunks for better throughput
+    while (remaining_len >= 32)
     {
-        // Load 16 bytes of text
-        uint8x16_t text_vec = vld1q_u8((const uint8_t *)current_pos);
+        // Double-distance prefetch
+        if (LIKELY(remaining_len > PREFETCH_DISTANCE_FAR))
+        {
+            __builtin_prefetch(current_pos + PREFETCH_DISTANCE, 0, 0);
+            __builtin_prefetch(current_pos + PREFETCH_DISTANCE_FAR, 0, 0);
+        }
+
+        // Load two 16-byte NEON registers
+        uint8x16_t text_vec0 = vld1q_u8((const uint8_t *)current_pos);
+        uint8x16_t text_vec1 = vld1q_u8((const uint8_t *)(current_pos + 16));
 
         // Compare with first character
-        uint8x16_t cmp = vceqq_u8(text_vec, first_char_vec);
+        uint8x16_t cmp0 = vceqq_u8(text_vec0, first_char_vec);
+        uint8x16_t cmp1 = vceqq_u8(text_vec1, first_char_vec);
 
-        // Check if any match found
-        // vmaxvq_u8 returns the maximum value across the vector. If any byte matched (0xFF), result is 0xFF.
-        if (vmaxvq_u8(cmp) != 0)
+        // Extract 16-bit mask: store comparison results and build bitmask manually.
+        // This is faster than vmaxvq_u8 + iteration on Apple Silicon.
+        uint8_t match_buf[32] __attribute__((aligned(16)));
+        vst1q_u8(match_buf, cmp0);
+        vst1q_u8(match_buf + 16, cmp1);
+
+        uint32_t match_mask32 = 0;
+        // Pack 32 bytes into a 32-bit mask (bit i = 1 if match_buf[i] != 0)
+        for (int k = 0; k < 32; k++) {
+            if (match_buf[k] != 0)
+                match_mask32 |= (1u << k);
+        }
+
+        if (match_mask32 != 0)
         {
-            // Extract mask to find exact positions
-            // Since NEON doesn't have a direct movemask, we simulate it or iterate.
-            // For simplicity and portability, we can store the comparison result to a temporary array
-            // or use a narrowing shift trick to create a 64-bit mask.
-            
-            // Efficient mask extraction for NEON:
-            uint8_t match_mask[16] __attribute__((aligned(16)));
-            vst1q_u8(match_mask, cmp);
-
-            for (int i = 0; i < 16; ++i)
+            // Iterate over set bits
+            for (int lane = 0; lane < 32 && match_mask32 != 0; lane++)
             {
-                if (match_mask[i] != 0)
+                if (match_mask32 & 1u)
                 {
-                    // Potential match at offset i
-                    // Check bounds for full pattern match
-                    if (remaining_len - i < pattern_len) 
-                        continue; // Should be handled by outer loop condition mostly, but safety first
-
-                    // Verify full pattern match
-                    if (memcmp(current_pos + i, pattern, pattern_len) == 0)
+                    // Verify bounds
+                    if (remaining_len - lane < pattern_len)
                     {
-                        size_t match_start_offset = (current_pos - text_start) + i;
+                        match_mask32 >>= 1;
+                        continue;
+                    }
+                    // Verify full pattern match
+                    if (memcmp(current_pos + lane, pattern, pattern_len) == 0)
+                    {
+                        size_t match_start_offset = (current_pos - text_start) + lane;
 
                         // Whole word check
-                        if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
+                        if (params->whole_word &&
+                            !is_whole_word_match(text_start, text_len, match_start_offset,
+                                                match_start_offset + pattern_len))
                         {
+                            match_mask32 >>= 1;
                             continue;
                         }
 
@@ -4632,33 +5018,24 @@ uint64_t neon_search(const search_params_t *params,
                             if (line_start != last_counted_line_start)
                             {
                                 if (current_count >= max_count) goto end_neon_search;
-
                                 current_count++;
                                 last_counted_line_start = line_start;
                                 count_incremented_this_match = true;
 
-                                // Optimization: skip to end of line
+                                // Skip to end of this line
                                 size_t line_end = find_line_end(text_start, text_len, line_start);
                                 if (line_end < text_len)
                                 {
-                                    // Calculate how much to advance current_pos to reach the start of the next line
-                                    // current_pos is the start of the current 16-byte chunk
-                                    // We want current_pos to become (text_start + line_end + 1)
-                                    
                                     size_t next_line_start = line_end + 1;
-                                    size_t current_pos_offset = current_pos - text_start;
-                                    
-                                    // Ensure we are advancing forward
-                                    if (next_line_start > current_pos_offset)
+                                    size_t current_offset = current_pos - text_start;
+
+                                    if (next_line_start > current_offset)
                                     {
-                                        size_t advance = next_line_start - current_pos_offset;
-                                        
-                                        // Ensure we don't advance past end
+                                        size_t advance = next_line_start - current_offset;
                                         if (advance > remaining_len) advance = remaining_len;
-                                        
                                         current_pos += advance;
                                         remaining_len -= advance;
-                                        goto next_chunk; // Jump to next iteration of outer loop
+                                        goto next_chunk_neon;
                                     }
                                 }
                             }
@@ -4666,7 +5043,6 @@ uint64_t neon_search(const search_params_t *params,
                         else
                         {
                             if (current_count >= max_count) goto end_neon_search;
-
                             current_count++;
                             count_incremented_this_match = true;
 
@@ -4674,7 +5050,8 @@ uint64_t neon_search(const search_params_t *params,
                             {
                                 if (current_count <= max_count)
                                 {
-                                    if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
+                                    if (!match_result_add(result, match_start_offset,
+                                                         match_start_offset + pattern_len))
                                     {
                                         fprintf(stderr, "Warning: Failed to add NEON match position.\n");
                                     }
@@ -4683,61 +5060,40 @@ uint64_t neon_search(const search_params_t *params,
                         }
 
                         if (count_incremented_this_match && current_count >= max_count)
-                        {
                             goto end_neon_search;
-                        }
-                        
-                        // If only_matching is false (finding all occurrences including overlaps not typically required for simple search unless specified)
-                        // But standard grep doesn't usually overlap. 
-                        // If we found a match, we can potentially skip pattern_len - 1 to avoid re-checking.
-                        // However, for simplicity and correctness with the loop i++, we just continue.
-                        // Optimizing this would require jumping 'i'.
                     }
                 }
+                match_mask32 >>= 1;
             }
         }
-        
-        // Advance to next chunk
-        current_pos += 16;
-        remaining_len -= 16;
-        
-    next_chunk:;
+
+        current_pos += 32;
+        remaining_len -= 32;
+    next_chunk_neon:;
     }
 
-    // Handle tail
+    // Handle tail with Boyer-Moore
     if (remaining_len >= pattern_len)
     {
         search_params_t tail_params = *params;
         if (max_count != SIZE_MAX)
-        {
             tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
-        }
-        
+
         uint64_t tail_count = boyer_moore_search(&tail_params, current_pos, remaining_len, result);
-        
-        // Fixup result offsets if needed (boyer_moore adds relative to current_pos if we passed result)
-        // Actually boyer_moore adds absolute offsets if we pass text_start as current_pos? 
-        // No, boyer_moore takes "text_start" argument. If we pass `current_pos`, it treats that as 0.
-        // So we need to adjust if we passed `result`.
-        
+
         if (result && track_positions && tail_count > 0)
         {
-             // Fix offsets for the tail matches
-             size_t tail_offset = current_pos - text_start;
-             // The matches were added at the end of result->positions
-             // We need to find which ones were just added.
-             // This is tricky if we don't know exactly how many were added, but we do: tail_count.
-             // Wait, boyer_moore returns the count.
-             
-             size_t start_idx = result->count - tail_count;
-             if (result->count >= tail_count) { // Safety check
-                 for(size_t k = 0; k < tail_count; ++k) {
-                     result->positions[start_idx + k].start_offset += tail_offset;
-                     result->positions[start_idx + k].end_offset += tail_offset;
-                 }
-             }
+            size_t tail_offset = current_pos - text_start;
+            size_t start_idx = result->count - tail_count;
+            if (result->count >= tail_count)
+            {
+                for (size_t k = 0; k < tail_count; ++k)
+                {
+                    result->positions[start_idx + k].start_offset += tail_offset;
+                    result->positions[start_idx + k].end_offset += tail_offset;
+                }
+            }
         }
-        
         current_count += tail_count;
     }
 

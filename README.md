@@ -1,6 +1,6 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-2.3.0-blue)
+![Version](https://img.shields.io/badge/version-2.4.0-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
@@ -18,7 +18,7 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 
 ## Key Features
 
-- **Multiple search algorithms**: Boyer-Moore-Horspool, KMP, Aho-Corasick for optimal performance across different pattern types
+- **Multiple search algorithms**: Boyer-Moore-Horspool, KMP, Two-Way, Shift-Or/BNDM, Aho-Corasick for optimal performance across different pattern types
 - **Algorithm selection**: Automatic smart selection with optional `--algo` override for fine-tuning
 - **SIMD acceleration**: Uses SSE4.2, AVX2, or NEON instructions when available for blazing-fast searches
 - **Memory-mapped I/O**: Maximizes throughput when processing large files
@@ -143,7 +143,7 @@ cat krep.c | krep 'c'
 - `-F, --fixed-strings` Interpret pattern as fixed string(s) (default unless -E is used)
 - `-r, --recursive` Recursively search directories
 - `--gitignore` Respect `.gitignore` files during recursive search
-- `--algo=ALGO` Force search algorithm: `auto` (default), `bm` (Boyer-Moore), `kmp` (KMP)
+- `--algo=ALGO` Force search algorithm: `auto` (default), `bm` (Boyer-Moore), `kmp` (KMP), `bndm` (Shift-Or), `two` (Two-Way)
 - `-t NUM, --threads=NUM` Use NUM threads for file search (default: auto)
 - `-s STRING, --string=STRING` Search in the provided STRING instead of file(s)
 - `-w, --word-regexp` Match only whole words
@@ -186,13 +186,15 @@ Krep achieves its high performance through several key techniques:
 Krep automatically selects the optimal search algorithm based on the pattern and available hardware:
 
 - **Boyer-Moore-Horspool** for most literal string searches
+- **Two-Way** algorithm for general scalar fallback (O(n+m) worst-case)
+- **Shift-Or / BNDM** bit-parallel search for short patterns (2–8 bytes)
 - **Knuth-Morris-Pratt (KMP)** for very short patterns and repetitive patterns
 - **memchr optimization** for single-character patterns
 - **SIMD Acceleration** (SSE4.2, AVX2, or NEON) for compatible hardware
 - **Regex Engine** for regular expression patterns
 - **Aho-Corasick** for efficient multiple pattern matching (auto-selected with multiple `-e` patterns)
 
-Use `--algo=bm` or `--algo=kmp` to override the automatic selection for single-pattern literal searches.
+Use `--algo=bm`, `--algo=kmp`, `--algo=bndm`, or `--algo=two` to override the automatic selection for single-pattern literal searches.
 
 ### 2. Multi-threading Architecture
 

@@ -1,7 +1,7 @@
 /* krep.h - Header file for krep utility
  *
  * Author: Davide Santangelo
- * Year: 2025
+ * Year: 2025-2026
  */
 
 #ifndef KREP_H
@@ -17,6 +17,10 @@
 
 // --- Global Variables (declared extern) ---
 extern unsigned char lower_table[256];
+
+// Fast word-character classification: pre-computed 256-byte lookup replaces isalnum()
+// for hot-path whole-word checks.  Bit 0 = word-char (alnum or '_'), bit 1 = space/newline.
+extern unsigned char word_char_table[256];
 
 // Forward declaration for Aho-Corasick trie structure
 struct ac_trie;
@@ -208,7 +212,9 @@ uint64_t boyer_moore_search(const search_params_t *params, const char *text_star
 uint64_t kmp_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 uint64_t regex_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 uint64_t memchr_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
-uint64_t memchr_short_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result); // New function for short patterns
+uint64_t memchr_short_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result); // Short patterns 2-3 bytes
+uint64_t shift_or_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);     // v2.4: Bit-parallel Shift-Or
+uint64_t two_way_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);      // v2.4: Two-Way algorithm
 
 // SIMD functions (only declared if supported by compiler flags)
 #if defined(__SSE4_2__)
@@ -292,12 +298,15 @@ size_t find_line_end(const char *text, size_t text_len, size_t pos);
 /**
  * @brief Check if a character is a word character (alnum or _).
  *
+ * Uses a precomputed 256-byte lookup table instead of calling isalnum()
+ * for maximum speed in the hot path.  The table is initialised at startup.
+ *
  * @param c The character to check.
  * @return True if the character is a word character, false otherwise.
  */
 static inline bool is_word_char(char c)
 {
-   return (isalnum((unsigned char)c) || c == '_');
+   return (word_char_table[(unsigned char)c] & 1) != 0;
 }
 
 /**
