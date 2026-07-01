@@ -42,6 +42,8 @@ static bool is_repetitive_pattern(const char *pattern, size_t pattern_len);
 static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr, size_t current_pos, size_t needed);
 // Submit multiple tasks in one lock/unlock roundtrip.
 static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count);
+static size_t line_number_at_offset(const char *text, size_t offset);
+double get_time(void);
 
 // SIMD Intrinsics Includes based on compiler flags (from Makefile)
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -80,7 +82,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "2.4.0"
+#define VERSION "3.0.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -89,6 +91,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define CACHE_LINE_SIZE 64             // Modern CPU cache line size
 #define PREFETCH_DISTANCE 512          // Bytes ahead to prefetch
 #define PREFETCH_DISTANCE_FAR 1024     // Double-distance prefetch for streaming access
+#define MAX_GLOB_PATTERNS 128
 
 // Compiler hints for better optimization
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -121,6 +124,33 @@ static bool use_gitignore = false;         // --gitignore flag
 static const char *algo_override = NULL;   // --algo option
 static atomic_bool global_match_found_flag = false; // Used in recursive search
 static atomic_bool madvise_warning_emitted = false;   // Suppress repeated madvise warnings
+static bool show_line_numbers = false;
+static bool quiet_mode = false;
+static bool files_with_matches_mode = false;
+static bool files_without_match_mode = false;
+static bool stats_enabled = false;
+static bool include_hidden = false;
+static size_t context_before = 0;
+static size_t context_after = 0;
+static const char *include_globs[MAX_GLOB_PATTERNS];
+static size_t include_glob_count = 0;
+static const char *exclude_globs[MAX_GLOB_PATTERNS];
+static size_t exclude_glob_count = 0;
+
+typedef enum
+{
+    OUTPUT_TEXT = 0,
+    OUTPUT_JSONL = 1
+} output_mode_t;
+
+static output_mode_t output_mode = OUTPUT_TEXT;
+
+static atomic_uint_fast64_t stats_files_searched = 0;
+static atomic_uint_fast64_t stats_files_matched = 0;
+static atomic_uint_fast64_t stats_paths_skipped = 0;
+static atomic_uint_fast64_t stats_bytes_searched = 0;
+static atomic_uint_fast64_t stats_matches_found = 0;
+static double stats_start_time = 0.0;
 
 // Global lookup table for fast lowercasing
 unsigned char lower_table[256]; // Remove static
@@ -483,11 +513,553 @@ static inline void safe_append_to_batch(char **current_write_ptr_ptr, char *batc
     }
 }
 
+static void json_write_escaped(FILE *out, const char *data, size_t len)
+{
+    fputc('"', out);
+    for (size_t i = 0; i < len; ++i)
+    {
+        unsigned char c = (unsigned char)data[i];
+        switch (c)
+        {
+        case '"':
+            fputs("\\\"", out);
+            break;
+        case '\\':
+            fputs("\\\\", out);
+            break;
+        case '\b':
+            fputs("\\b", out);
+            break;
+        case '\f':
+            fputs("\\f", out);
+            break;
+        case '\n':
+            fputs("\\n", out);
+            break;
+        case '\r':
+            fputs("\\r", out);
+            break;
+        case '\t':
+            fputs("\\t", out);
+            break;
+        default:
+            if (c < 0x20)
+                fprintf(out, "\\u%04x", c);
+            else
+                fputc(c, out);
+            break;
+        }
+    }
+    fputc('"', out);
+}
+
+static size_t line_number_at_offset(const char *text, size_t offset)
+{
+    size_t line_number = 1;
+    const char *scan = text;
+    const char *end = text + offset;
+
+    while (scan < end)
+    {
+        const void *newline = memchr(scan, '\n', (size_t)(end - scan));
+        if (!newline)
+            break;
+        line_number++;
+        scan = (const char *)newline + 1;
+    }
+
+    return line_number;
+}
+
+static size_t previous_line_start(const char *text, size_t line_start)
+{
+    if (line_start == 0)
+        return 0;
+
+    size_t pos = line_start - 1;
+    if (pos > 0 && text[pos] == '\n')
+        pos--;
+
+    while (pos > 0 && text[pos - 1] != '\n')
+        pos--;
+
+    return pos;
+}
+
+static size_t context_start_for_line(const char *text, size_t line_start, size_t before)
+{
+    size_t start = line_start;
+    for (size_t i = 0; i < before && start > 0; ++i)
+        start = previous_line_start(text, start);
+    return start;
+}
+
+static size_t context_end_for_line(const char *text, size_t text_len, size_t line_end, size_t after)
+{
+    size_t end = line_end;
+    for (size_t i = 0; i < after && end < text_len; ++i)
+    {
+        size_t next_line_start = (end < text_len && text[end] == '\n') ? end + 1 : end;
+        if (next_line_start >= text_len)
+            break;
+        end = find_line_end(text, text_len, next_line_start);
+    }
+    return end;
+}
+
+static void print_text_prefix(const char *filename, size_t line_number, bool is_context)
+{
+    const char separator = is_context ? '-' : ':';
+
+    if (filename)
+    {
+        if (color_output_enabled)
+        {
+            fputs(KREP_COLOR_FILENAME, stdout);
+            fputs(filename, stdout);
+            fputs(KREP_COLOR_RESET, stdout);
+            fputs(KREP_COLOR_SEPARATOR, stdout);
+            fputc(separator, stdout);
+            fputs(KREP_COLOR_RESET, stdout);
+        }
+        else
+        {
+            fputs(filename, stdout);
+            fputc(separator, stdout);
+        }
+    }
+
+    if (show_line_numbers || context_before > 0 || context_after > 0)
+    {
+        if (color_output_enabled)
+            fputs(KREP_COLOR_LINE_NUMBER, stdout);
+        printf("%zu", line_number);
+        if (color_output_enabled)
+        {
+            fputs(KREP_COLOR_RESET, stdout);
+            fputs(KREP_COLOR_SEPARATOR, stdout);
+            fputc(separator, stdout);
+            fputs(KREP_COLOR_RESET, stdout);
+            fputs(KREP_COLOR_TEXT, stdout);
+        }
+        else
+        {
+            fputc(separator, stdout);
+        }
+    }
+    else if (color_output_enabled)
+    {
+        fputs(KREP_COLOR_TEXT, stdout);
+    }
+}
+
+static void print_text_line_with_matches(const char *filename,
+                                         const char *text,
+                                         size_t line_start,
+                                         size_t line_end,
+                                         size_t line_number,
+                                         const match_position_t *matches,
+                                         size_t match_count,
+                                         bool is_context)
+{
+    print_text_prefix(filename, line_number, is_context);
+
+    if (is_context || match_count == 0)
+    {
+        fwrite(text + line_start, 1, line_end - line_start, stdout);
+        if (color_output_enabled)
+            fputs(KREP_COLOR_RESET, stdout);
+        fputc('\n', stdout);
+        return;
+    }
+
+    size_t current = line_start;
+    for (size_t i = 0; i < match_count; ++i)
+    {
+        size_t start = matches[i].start_offset;
+        size_t end = matches[i].end_offset;
+
+        if (start < current)
+            start = current;
+        if (start < line_start)
+            start = line_start;
+        if (end > line_end)
+            end = line_end;
+        if (start >= end)
+            continue;
+
+        if (start > current)
+            fwrite(text + current, 1, start - current, stdout);
+
+        if (color_output_enabled)
+            fputs(KREP_COLOR_MATCH, stdout);
+        fwrite(text + start, 1, end - start, stdout);
+        if (color_output_enabled)
+            fputs(KREP_COLOR_TEXT, stdout);
+
+        current = end;
+    }
+
+    if (current < line_end)
+        fwrite(text + current, 1, line_end - current, stdout);
+
+    if (color_output_enabled)
+        fputs(KREP_COLOR_RESET, stdout);
+    fputc('\n', stdout);
+}
+
+static void print_json_count_result(const char *filename, uint64_t count)
+{
+    fputs("{\"type\":\"count\"", stdout);
+    if (filename)
+    {
+        fputs(",\"path\":", stdout);
+        json_write_escaped(stdout, filename, strlen(filename));
+    }
+    printf(",\"count\":%" PRIu64 "}\n", count);
+}
+
+static void print_count_result(const char *filename, uint64_t count)
+{
+    if (quiet_mode || files_with_matches_mode || files_without_match_mode)
+        return;
+
+    if (output_mode == OUTPUT_JSONL)
+    {
+        print_json_count_result(filename, count);
+    }
+    else if (filename)
+    {
+        printf("%s:%" PRIu64 "\n", filename, count);
+    }
+    else
+    {
+        printf("%" PRIu64 "\n", count);
+    }
+}
+
+static void print_file_list_result(const char *filename, int result_code)
+{
+    if (quiet_mode || !filename || strcmp(filename, "-") == 0)
+        return;
+
+    if ((files_with_matches_mode && result_code == 0) ||
+        (files_without_match_mode && result_code == 1))
+    {
+        if (output_mode == OUTPUT_JSONL)
+        {
+            fputs("{\"type\":\"path\",\"path\":", stdout);
+            json_write_escaped(stdout, filename, strlen(filename));
+            printf(",\"matched\":%s}\n", result_code == 0 ? "true" : "false");
+        }
+        else
+        {
+            puts(filename);
+        }
+    }
+}
+
+static void record_search_stats(size_t bytes, uint64_t matches, int result_code)
+{
+    if (!stats_enabled)
+        return;
+
+    atomic_fetch_add_explicit(&stats_files_searched, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&stats_bytes_searched, (uint64_t)bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&stats_matches_found, matches, memory_order_relaxed);
+    if (result_code == 0)
+        atomic_fetch_add_explicit(&stats_files_matched, 1, memory_order_relaxed);
+}
+
+static void KREP_UNUSED print_stats_summary(int exit_code)
+{
+    if (!stats_enabled)
+        return;
+
+    double elapsed = get_time() - stats_start_time;
+    uint64_t files = atomic_load_explicit(&stats_files_searched, memory_order_relaxed);
+    uint64_t matched = atomic_load_explicit(&stats_files_matched, memory_order_relaxed);
+    uint64_t skipped = atomic_load_explicit(&stats_paths_skipped, memory_order_relaxed);
+    uint64_t bytes = atomic_load_explicit(&stats_bytes_searched, memory_order_relaxed);
+    uint64_t matches = atomic_load_explicit(&stats_matches_found, memory_order_relaxed);
+
+    fprintf(stderr,
+            "krep stats: files=%" PRIu64 " matched=%" PRIu64 " skipped=%" PRIu64
+            " bytes=%" PRIu64 " matches=%" PRIu64 " time=%.6fs exit=%d\n",
+            files, matched, skipped, bytes, matches, elapsed, exit_code);
+}
+
+typedef struct
+{
+    size_t start;
+    size_t end;
+    size_t line_number;
+    uint64_t first_match_index;
+    uint64_t match_count;
+} printable_line_t;
+
+static bool add_printable_line(printable_line_t **lines,
+                               size_t *count,
+                               size_t *capacity,
+                               printable_line_t line)
+{
+    if (*count >= *capacity)
+    {
+        size_t new_capacity = (*capacity == 0) ? 64 : (*capacity * 2);
+        printable_line_t *new_lines = realloc(*lines, new_capacity * sizeof(printable_line_t));
+        if (!new_lines)
+            return false;
+        *lines = new_lines;
+        *capacity = new_capacity;
+    }
+
+    (*lines)[(*count)++] = line;
+    return true;
+}
+
+static printable_line_t *build_printable_lines(const char *text,
+                                               size_t text_len,
+                                               const match_result_t *result,
+                                               size_t max_count,
+                                               size_t *line_count_out)
+{
+    printable_line_t *lines = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    size_t last_line_start = SIZE_MAX;
+
+    for (uint64_t i = 0; i < result->count; ++i)
+    {
+        size_t match_start = result->positions[i].start_offset;
+        if (match_start >= text_len)
+            continue;
+
+        size_t line_start = find_line_start(text, text_len, match_start);
+        if (line_start == last_line_start && count > 0)
+        {
+            lines[count - 1].match_count++;
+            continue;
+        }
+
+        if (max_count != SIZE_MAX && count >= max_count)
+            break;
+
+        printable_line_t line = {
+            .start = line_start,
+            .end = find_line_end(text, text_len, line_start),
+            .line_number = line_number_at_offset(text, line_start),
+            .first_match_index = i,
+            .match_count = 1};
+
+        if (!add_printable_line(&lines, &count, &capacity, line))
+        {
+            free(lines);
+            *line_count_out = 0;
+            return NULL;
+        }
+        last_line_start = line_start;
+    }
+
+    *line_count_out = count;
+    return lines;
+}
+
+static size_t copy_line_matches(const match_result_t *result,
+                                const printable_line_t *line,
+                                match_position_t *out,
+                                size_t out_capacity)
+{
+    size_t copied = 0;
+    uint64_t end_index = line->first_match_index + line->match_count;
+    for (uint64_t i = line->first_match_index; i < end_index && copied < out_capacity; ++i)
+    {
+        out[copied++] = result->positions[i];
+    }
+    return copied;
+}
+
+static size_t print_contextual_matching_items(const char *filename,
+                                              const char *text,
+                                              size_t text_len,
+                                              const match_result_t *result,
+                                              const search_params_t *params)
+{
+    size_t printable_count = 0;
+    printable_line_t *lines = build_printable_lines(text, text_len, result, params->max_count, &printable_count);
+    if (!lines || printable_count == 0)
+    {
+        free(lines);
+        return 0;
+    }
+
+    size_t items_printed = 0;
+    size_t last_output_next_start = 0;
+    bool emitted_any_line = false;
+    size_t next_match_line = 0;
+    match_position_t line_matches[2048];
+
+    for (size_t i = 0; i < printable_count;)
+    {
+        if (lines[i].start < last_output_next_start)
+        {
+            i++;
+            continue;
+        }
+
+        size_t block_start = context_start_for_line(text, lines[i].start, context_before);
+        size_t block_end = context_end_for_line(text, text_len, lines[i].end, context_after);
+
+        if (block_start < last_output_next_start)
+            block_start = last_output_next_start;
+
+        if ((context_before > 0 || context_after > 0) && emitted_any_line && block_start > last_output_next_start)
+        {
+            puts("--");
+        }
+
+        size_t line_start = block_start;
+        while (line_start < text_len && line_start <= block_end)
+        {
+            size_t line_end = find_line_end(text, text_len, line_start);
+            while (next_match_line < printable_count && lines[next_match_line].start < line_start)
+                next_match_line++;
+
+            bool is_match_line = (next_match_line < printable_count && lines[next_match_line].start == line_start);
+            size_t match_count = 0;
+            if (is_match_line)
+            {
+                match_count = copy_line_matches(result, &lines[next_match_line], line_matches,
+                                                sizeof(line_matches) / sizeof(line_matches[0]));
+                items_printed++;
+                next_match_line++;
+            }
+
+            print_text_line_with_matches(filename,
+                                         text,
+                                         line_start,
+                                         line_end,
+                                         line_number_at_offset(text, line_start),
+                                         line_matches,
+                                         match_count,
+                                         !is_match_line);
+            emitted_any_line = true;
+
+            if (line_end >= text_len)
+            {
+                last_output_next_start = text_len;
+                break;
+            }
+            line_start = line_end + 1;
+            last_output_next_start = line_start;
+        }
+
+        while (i < printable_count && lines[i].start < last_output_next_start)
+            i++;
+    }
+
+    free(lines);
+    return items_printed;
+}
+
+static size_t print_json_matching_items(const char *filename,
+                                        const char *text,
+                                        size_t text_len,
+                                        const match_result_t *result,
+                                        const search_params_t *params)
+{
+    if (only_matching)
+    {
+        size_t items_printed = 0;
+        for (uint64_t i = 0; i < result->count; ++i)
+        {
+            if (params->max_count != SIZE_MAX && items_printed >= params->max_count)
+                break;
+
+            size_t start = result->positions[i].start_offset;
+            size_t end = result->positions[i].end_offset;
+            if (start >= text_len || start > end)
+                continue;
+            if (end > text_len)
+                end = text_len;
+
+            size_t line_start = find_line_start(text, text_len, start);
+            fputs("{\"type\":\"match\"", stdout);
+            if (filename)
+            {
+                fputs(",\"path\":", stdout);
+                json_write_escaped(stdout, filename, strlen(filename));
+            }
+            printf(",\"line_number\":%zu,\"byte_start\":%zu,\"byte_end\":%zu,\"column_start\":%zu,\"column_end\":%zu,\"match\":",
+                   line_number_at_offset(text, start),
+                   start,
+                   end,
+                   start - line_start + 1,
+                   end - line_start + 1);
+            json_write_escaped(stdout, text + start, end - start);
+            fputs("}\n", stdout);
+            items_printed++;
+        }
+        return items_printed;
+    }
+
+    size_t printable_count = 0;
+    printable_line_t *lines = build_printable_lines(text, text_len, result, params->max_count, &printable_count);
+    if (!lines)
+        return 0;
+
+    for (size_t i = 0; i < printable_count; ++i)
+    {
+        fputs("{\"type\":\"line\"", stdout);
+        if (filename)
+        {
+            fputs(",\"path\":", stdout);
+            json_write_escaped(stdout, filename, strlen(filename));
+        }
+        printf(",\"line_number\":%zu,\"byte_start\":%zu,\"byte_end\":%zu,\"text\":",
+               lines[i].line_number,
+               lines[i].start,
+               lines[i].end);
+        json_write_escaped(stdout, text + lines[i].start, lines[i].end - lines[i].start);
+        fputs(",\"matches\":[", stdout);
+
+        uint64_t end_index = lines[i].first_match_index + lines[i].match_count;
+        for (uint64_t j = lines[i].first_match_index; j < end_index; ++j)
+        {
+            size_t start = result->positions[j].start_offset;
+            size_t end = result->positions[j].end_offset;
+            if (end > lines[i].end)
+                end = lines[i].end;
+            if (start < lines[i].start || start >= end)
+                continue;
+            if (j > lines[i].first_match_index)
+                fputc(',', stdout);
+            printf("{\"column_start\":%zu,\"column_end\":%zu,\"byte_start\":%zu,\"byte_end\":%zu}",
+                   start - lines[i].start + 1,
+                   end - lines[i].start + 1,
+                   start,
+                   end);
+        }
+        fputs("]}\n", stdout);
+    }
+
+    free(lines);
+    return printable_count;
+}
+
 size_t print_matching_items(const char *filename, const char *text, size_t text_len, const match_result_t *result, const search_params_t *params)
 {
     // Basic validation: No results, no text, or zero matches means nothing to print.
     if (!result || !text || result->count == 0)
         return 0;
+
+    if (quiet_mode || files_with_matches_mode || files_without_match_mode)
+        return 0;
+
+    if (output_mode == OUTPUT_JSONL)
+        return print_json_matching_items(filename, text, text_len, result, params);
+
+    if (!only_matching && (show_line_numbers || context_before > 0 || context_after > 0))
+        return print_contextual_matching_items(filename, text, text_len, result, params);
 
     size_t items_printed_count = 0;
     size_t max_count = params->max_count; // Get max_count from params
@@ -1189,14 +1761,26 @@ void print_usage(const char *program_name)
 
     printf("%sScope & Performance%s\n", section, reset);
     printf("  %s-r%s             Search directories recursively.\n", option, reset);
+    printf("  %s--glob=GLOB%s    Include only files matching GLOB (repeatable).\n", option, reset);
+    printf("  %s--exclude=GLOB%s Exclude paths matching GLOB (repeatable).\n", option, reset);
+    printf("  %s--hidden%s       Include hidden files and directories.\n", option, reset);
     printf("  %s--gitignore%s    Respect .gitignore when used with -r.\n", option, reset);
     printf("  %s--algo=ALGO%s    Force algorithm: auto (default), bm, kmp, bndm, two.\n", option, reset);
     printf("  %s-t NUM%s         Set thread count (default: auto).\n", option, reset);
     printf("  %s--no-simd%s      Disable SIMD acceleration.\n\n", option, reset);
 
     printf("%sOutput & UX%s\n", section, reset);
+    printf("  %s-n%s             Show line numbers.\n", option, reset);
+    printf("  %s-A NUM%s         Show NUM lines after each matching line.\n", option, reset);
+    printf("  %s-B NUM%s         Show NUM lines before each matching line.\n", option, reset);
+    printf("  %s-C NUM%s         Show NUM lines of surrounding context.\n", option, reset);
     printf("  %s-o%s             Print only matching parts, one per line.\n", option, reset);
     printf("  %s-c%s             Print only match counts.\n", option, reset);
+    printf("  %s-l%s             Print files with matches.\n", option, reset);
+    printf("  %s-L%s             Print files without matches.\n", option, reset);
+    printf("  %s-q%s             Quiet mode; only set exit status.\n", option, reset);
+    printf("  %s--json%s         Emit JSON Lines for matches/counts/paths.\n", option, reset);
+    printf("  %s--stats%s        Print a compact search summary to stderr.\n", option, reset);
     printf("  %s-m NUM%s         Stop after NUM matching lines per file.\n", option, reset);
     printf("  %s-s%s             Search in STRING_TO_SEARCH.\n", option, reset);
     printf("  %s--color[=WHEN]%s Color mode: always, never, auto (default).\n", option, reset);
@@ -1214,7 +1798,8 @@ void print_usage(const char *program_name)
     printf("  %s -t 8 -o '[0-9]+' data.log | sort | uniq -c\n", program_name);
     printf("  %s -E \"^[Ee]rror: .*failed\" system.log\n", program_name);
     printf("  %s -r \"MyClass\" /path/to/project\n", program_name);
-    printf("  %s -r --gitignore \"TODO\" /path/to/project\n", program_name);
+    printf("  %s -r --gitignore --glob='*.c' \"TODO\" .\n", program_name);
+    printf("  %s --json -n \"panic\" app.log\n", program_name);
     printf("  %s -e Error -e Warning app.log\n", program_name);
     printf("  echo 'pattern' | %s -f - target.txt\n", program_name);
 }
@@ -2580,7 +3165,7 @@ int search_string(const search_params_t *params, const char *text)
 
     if (current_params.count_lines_mode || current_params.count_matches_mode)
     {
-        printf("%" PRIu64 "\n", final_count);
+        print_count_result(NULL, final_count);
     }
     else
     {
@@ -2591,9 +3176,14 @@ int search_string(const search_params_t *params, const char *text)
             print_matching_items(NULL, text, text_len, matches, &current_params); // Pass params
         }
         // Handle case where match was found but no positions recorded (e.g., empty regex match)
-        else if (result_code == 0 && (!matches || matches->count == 0))
+        else if (result_code == 0 && (!matches || matches->count == 0) &&
+                 !quiet_mode && !files_with_matches_mode && !files_without_match_mode)
         {
-            if (only_matching)
+            if (output_mode == OUTPUT_JSONL)
+            {
+                fputs("{\"type\":\"line\",\"line_number\":1,\"byte_start\":0,\"byte_end\":0,\"text\":\"\",\"matches\":[]}\n", stdout);
+            }
+            else if (only_matching)
             {
                 // Print empty match for -o (consistent with grep)
                 puts("");
@@ -2605,6 +3195,8 @@ int search_string(const search_params_t *params, const char *text)
             }
         }
     }
+
+    record_search_stats(text_len, final_count, result_code);
 
 cleanup:
     // --- Cleanup ---
@@ -2867,9 +3459,25 @@ int search_file(const search_params_t *params, const char *filename, int request
 
         if (empty_match)
         {
+            result_code = 0;
+            uint64_t empty_count = 1;
             if (current_params.count_lines_mode || current_params.count_matches_mode)
             {
-                printf("%s:1\n", filename); // Print count 1
+                print_count_result(filename, empty_count);
+            }
+            else if (files_with_matches_mode || files_without_match_mode)
+            {
+                print_file_list_result(filename, result_code);
+            }
+            else if (quiet_mode)
+            {
+                // Nothing to print.
+            }
+            else if (output_mode == OUTPUT_JSONL)
+            {
+                fputs("{\"type\":\"line\",\"path\":", stdout);
+                json_write_escaped(stdout, filename, strlen(filename));
+                fputs(",\"line_number\":1,\"byte_start\":0,\"byte_end\":0,\"text\":\"\",\"matches\":[]}\n", stdout);
             }
             else if (only_matching)
             {                               // -o (global flag)
@@ -2880,12 +3488,17 @@ int search_file(const search_params_t *params, const char *filename, int request
                 printf("%s:\n", filename); // Print filename: followed by empty line
             }
             atomic_store(&global_match_found_flag, true); // Signal match found for -r
+            record_search_stats(file_size, empty_count, result_code);
             return 0;                                     // Match found
         }
         else
         {
+            result_code = 1;
             if (current_params.count_lines_mode || current_params.count_matches_mode)
-                printf("%s:0\n", filename); // Print count 0
+                print_count_result(filename, 0);
+            else if (files_with_matches_mode || files_without_match_mode)
+                print_file_list_result(filename, result_code);
+            record_search_stats(file_size, 0, result_code);
             return 1;                       // No match
         }
     }
@@ -2895,7 +3508,10 @@ int search_file(const search_params_t *params, const char *filename, int request
     {
         close(fd);
         if (current_params.count_lines_mode || current_params.count_matches_mode)
-            printf("%s:0\n", filename);
+            print_count_result(filename, 0);
+        else if (files_with_matches_mode || files_without_match_mode)
+            print_file_list_result(filename, 1);
+        record_search_stats(file_size, 0, 1);
         return 1; // No match possible
     }
 
@@ -3428,9 +4044,13 @@ int search_file(const search_params_t *params, const char *filename, int request
         if (result_code == 0)
             atomic_store(&global_match_found_flag, true); // Signal match found for -r
 
-        if (current_params.count_lines_mode || current_params.count_matches_mode)
+        if (files_with_matches_mode || files_without_match_mode)
         {
-            printf("%s:%" PRIu64 "\n", filename, final_count);
+            print_file_list_result(filename, result_code);
+        }
+        else if (current_params.count_lines_mode || current_params.count_matches_mode)
+        {
+            print_count_result(filename, final_count);
         }
         else if (result_code == 0 && global_matches)
         {
@@ -3443,9 +4063,15 @@ int search_file(const search_params_t *params, const char *filename, int request
             print_matching_items(filename, file_data, file_size, global_matches, &current_params); // Pass params
         }
         // Handle case where match was found but no positions recorded (e.g., empty regex match)
-        else if (result_code == 0 && (!global_matches || global_matches->count == 0))
+        else if (result_code == 0 && (!global_matches || global_matches->count == 0) && !quiet_mode)
         {
-            if (only_matching)
+            if (output_mode == OUTPUT_JSONL)
+            {
+                fputs("{\"type\":\"line\",\"path\":", stdout);
+                json_write_escaped(stdout, filename, strlen(filename));
+                fputs(",\"line_number\":1,\"byte_start\":0,\"byte_end\":0,\"text\":\"\",\"matches\":[]}\n", stdout);
+            }
+            else if (only_matching)
             {
                 printf("%s:1:\n", filename); // Line number 1, empty match
             }
@@ -3454,6 +4080,8 @@ int search_file(const search_params_t *params, const char *filename, int request
                 printf("%s:\n", filename); // Empty line
             }
         }
+
+        record_search_stats(file_size, final_count, result_code);
     }
 
 cleanup_file:
@@ -3488,7 +4116,7 @@ cleanup_file:
 static bool should_skip_directory(const char *dirname)
 {
     // Skip hidden directories starting with '.' (in addition to "." and "..")
-    if (dirname[0] == '.' && strcmp(dirname, ".") != 0 && strcmp(dirname, "..") != 0)
+    if (!include_hidden && dirname[0] == '.' && strcmp(dirname, ".") != 0 && strcmp(dirname, "..") != 0)
     {
         return true;
     }
@@ -3555,6 +4183,48 @@ static bool is_binary_file(const char *filepath)
 
     // Check if a null byte exists within the read buffer
     return memchr(buffer, '\0', bytes_read) != NULL;
+}
+
+static bool glob_matches_path(const char *pattern, const char *path, const char *name)
+{
+    if (!pattern || !path || !name)
+        return false;
+
+    if (fnmatch(pattern, name, 0) == 0)
+        return true;
+
+    if (fnmatch(pattern, path, 0) == 0)
+        return true;
+
+    return false;
+}
+
+static bool glob_list_matches(const char **patterns, size_t count, const char *path, const char *name)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (glob_matches_path(patterns[i], path, name))
+            return true;
+    }
+    return false;
+}
+
+static bool path_is_excluded_by_cli(const char *path, const char *name)
+{
+    return glob_list_matches(exclude_globs, exclude_glob_count, path, name);
+}
+
+static bool file_is_included_by_cli(const char *path, const char *name)
+{
+    if (include_glob_count == 0)
+        return true;
+    return glob_list_matches(include_globs, include_glob_count, path, name);
+}
+
+static void note_skipped_path(void)
+{
+    if (stats_enabled)
+        atomic_fetch_add_explicit(&stats_paths_skipped, 1, memory_order_relaxed);
 }
 
 // --- Gitignore Support ---
@@ -3805,11 +4475,18 @@ static int search_directory_recursive_impl(const char *base_dir, const search_pa
             // Check if this directory should be skipped
             if (should_skip_directory(entry->d_name))
             {
+                note_skipped_path();
+                continue; // Skip this directory
+            }
+            if (path_is_excluded_by_cli(path_buffer, entry->d_name))
+            {
+                note_skipped_path();
                 continue; // Skip this directory
             }
             // Check gitignore patterns
             if (effective_gi && gitignore_is_ignored(effective_gi, entry->d_name, true))
             {
+                note_skipped_path();
                 continue; // Skip this directory per .gitignore
             }
             // Otherwise, recurse into the subdirectory
@@ -3818,21 +4495,39 @@ static int search_directory_recursive_impl(const char *base_dir, const search_pa
         // If the entry is a regular file:
         else if (S_ISREG(entry_stat.st_mode))
         {
-            // Check if the file should be skipped based on extension
-            if (should_skip_extension(entry->d_name))
+            if (!include_hidden && entry->d_name[0] == '.')
             {
+                note_skipped_path();
+                continue;
+            }
+            if (path_is_excluded_by_cli(path_buffer, entry->d_name))
+            {
+                note_skipped_path();
+                continue;
+            }
+            if (!file_is_included_by_cli(path_buffer, entry->d_name))
+            {
+                note_skipped_path();
+                continue;
+            }
+            // Check if the file should be skipped based on extension
+            if (include_glob_count == 0 && should_skip_extension(entry->d_name))
+            {
+                note_skipped_path();
                 continue; // Skip this file
             }
             // Check gitignore patterns
             if (effective_gi && gitignore_is_ignored(effective_gi, entry->d_name, false))
             {
+                note_skipped_path();
                 continue; // Skip this file per .gitignore
             }
 
             // Don't check binary files too aggressively as it might miss valid text files
             // Only check files larger than a certain threshold
-            if (entry_stat.st_size > 1024 * 1024 && is_binary_file(path_buffer))
+            if (include_glob_count == 0 && entry_stat.st_size > 1024 * 1024 && is_binary_file(path_buffer))
             {
+                note_skipped_path();
                 continue; // Skip this file - it's binary and large
             }
 
@@ -3890,15 +4585,28 @@ int main(int argc, char *argv[])
 
     // --- getopt_long Setup ---
     struct option long_options[] = {
-        {"color", optional_argument, 0, 'C'},     // --color[=WHEN]
+        {"color", optional_argument, 0, 258},     // --color[=WHEN]
         {"no-simd", no_argument, 0, 'S'},         // --no-simd
         {"help", no_argument, 0, 'h'},            // --help
         {"version", no_argument, 0, 'v'},         // --version
         {"fixed-strings", no_argument, 0, 'F'},   // --fixed-strings, same as default
         {"regexp", required_argument, 0, 'e'},    // Treat -e as --regexp for consistency
         {"max-count", required_argument, 0, 'm'}, // --max-count=NUM option
+        {"line-number", no_argument, 0, 'n'},     // --line-number
+        {"after-context", required_argument, 0, 'A'},
+        {"before-context", required_argument, 0, 'B'},
+        {"context", required_argument, 0, 'C'},
+        {"quiet", no_argument, 0, 'q'},
+        {"files-with-matches", no_argument, 0, 'l'},
+        {"files-without-match", no_argument, 0, 'L'},
         {"gitignore", no_argument, 0, 256},       // --gitignore
         {"algo", required_argument, 0, 257},      // --algo=ALGO
+        {"json", no_argument, 0, 259},
+        {"jsonl", no_argument, 0, 259},
+        {"stats", no_argument, 0, 260},
+        {"glob", required_argument, 0, 261},
+        {"exclude", required_argument, 0, 262},
+        {"hidden", no_argument, 0, 263},
         {0, 0, 0, 0}                              // Terminator
     };
     int option_index = 0;
@@ -3908,7 +4616,7 @@ int main(int argc, char *argv[])
     params.max_count = SIZE_MAX;
 
     // --- Parse Command Line Options ---
-    while ((opt = getopt_long(argc, argv, "+e:f:icm:oEFrt:s:vhw", long_options, &option_index)) != -1)
+    while ((opt = getopt_long(argc, argv, "+e:f:icm:oEFrt:s:vhwnqA:B:C:lL", long_options, &option_index)) != -1)
     {
         switch (opt)
         {
@@ -3921,6 +4629,41 @@ int main(int argc, char *argv[])
         case 'o': // Only matching parts
             only_matching = true;
             break;
+        case 'n': // Show line numbers
+            show_line_numbers = true;
+            break;
+        case 'q': // Quiet
+            quiet_mode = true;
+            break;
+        case 'l': // Files with matches
+            files_with_matches_mode = true;
+            break;
+        case 'L': // Files without matches
+            files_without_match_mode = true;
+            break;
+        case 'A': // After context
+        case 'B': // Before context
+        case 'C': // Symmetric context
+        {
+            char *endptr = NULL;
+            errno = 0;
+            long val = strtol(optarg, &endptr, 10);
+            if (errno != 0 || optarg == endptr || *endptr != '\0' || val < 0)
+            {
+                fprintf(stderr, "krep: Error: Invalid context value '%s'\n", optarg);
+                return 2;
+            }
+            if (opt == 'A')
+                context_after = (size_t)val;
+            else if (opt == 'B')
+                context_before = (size_t)val;
+            else
+            {
+                context_before = (size_t)val;
+                context_after = (size_t)val;
+            }
+            break;
+        }
         case 'm': // Max count
         {
             char *endptr = NULL;
@@ -4074,7 +4817,7 @@ int main(int argc, char *argv[])
             }
             break;
 
-        case 'C': // --color option
+        case 258: // --color option
             if (optarg == NULL || strcmp(optarg, "auto") == 0)
                 color_when = "auto";
             else if (strcmp(optarg, "always") == 0)
@@ -4110,6 +4853,32 @@ int main(int argc, char *argv[])
                 return 2;
             }
             break;
+        case 259: // --json / --jsonl
+            output_mode = OUTPUT_JSONL;
+            color_when = "never";
+            break;
+        case 260: // --stats
+            stats_enabled = true;
+            break;
+        case 261: // --glob
+            if (include_glob_count >= MAX_GLOB_PATTERNS)
+            {
+                fprintf(stderr, "krep: Error: Too many --glob patterns (max %d)\n", MAX_GLOB_PATTERNS);
+                return 2;
+            }
+            include_globs[include_glob_count++] = optarg;
+            break;
+        case 262: // --exclude
+            if (exclude_glob_count >= MAX_GLOB_PATTERNS)
+            {
+                fprintf(stderr, "krep: Error: Too many --exclude patterns (max %d)\n", MAX_GLOB_PATTERNS);
+                return 2;
+            }
+            exclude_globs[exclude_glob_count++] = optarg;
+            break;
+        case 263: // --hidden
+            include_hidden = true;
+            break;
         case '?': // Unknown option or missing argument from getopt
         default:  // Should not happen
             print_usage(argv[0]);
@@ -4120,7 +4889,9 @@ int main(int argc, char *argv[])
     // --- Finalize Parameter Setup ---
 
     // Determine color output setting
-    if (strcmp(color_when, "always") == 0)
+    if (output_mode == OUTPUT_JSONL)
+        color_output_enabled = false;
+    else if (strcmp(color_when, "always") == 0)
         color_output_enabled = true;
     else if (strcmp(color_when, "never") == 0)
         color_output_enabled = false;
@@ -4193,7 +4964,7 @@ int main(int argc, char *argv[])
             // If a pattern was given and stdin is not a tty, input will be from stdin.
             // target_arg remains NULL for stdin.
             // If stdin is a tty, it's an error because no file/pipe is provided.
-            if (num_patterns_found > 0 && isatty(STDIN_FILENO))
+            if (num_patterns_found > 0 && isatty(STDIN_FILENO) && !recursive_mode)
             {
                 fprintf(stderr, "krep: Error: Target file/directory missing and no input from pipe/redirect.\n");
                 for (size_t i = 0; i < num_patterns_found; ++i)
@@ -4225,11 +4996,34 @@ int main(int argc, char *argv[])
         return 2;
     }
 
+    if (files_with_matches_mode && files_without_match_mode)
+    {
+        fprintf(stderr, "krep: Error: --files-with-matches and --files-without-match cannot be used together.\n");
+        return 2;
+    }
+
+    if (recursive_mode && target_arg == NULL)
+    {
+        target_arg = ".";
+    }
+
     // Set final counting/tracking modes in params
     params.count_lines_mode = count_only_flag && !only_matching;  // -c only
     params.count_matches_mode = count_only_flag && only_matching; // -co (internal concept, currently unused externally)
     // Track positions unless only counting lines (-c without -o)
     params.track_positions = !(count_only_flag && !only_matching);
+
+    if (quiet_mode || files_with_matches_mode || files_without_match_mode)
+    {
+        params.count_lines_mode = false;
+        params.count_matches_mode = false;
+        params.track_positions = false;
+    }
+
+    if (stats_enabled)
+    {
+        stats_start_time = get_time();
+    }
 
     // If counting (-c) or printing only matches (-o), disable summary
 
@@ -4299,6 +5093,8 @@ int main(int argc, char *argv[])
             }
         }
     }
+
+    print_stats_summary(exit_code);
 
     // Return the final exit code (0=match, 1=no match, 2=error)
     return exit_code;

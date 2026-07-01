@@ -1,6 +1,6 @@
 # krep - A high-performance string search utility
 # Author: Davide Santangelo
-# Version: 2.4.0
+# Version: 3.0.0
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
@@ -60,7 +60,7 @@ TEST_TARGET = krep_test
 
 TARGET = krep
 
-.PHONY: all clean install uninstall test test-directory ci bench-rg
+.PHONY: all clean install uninstall test test-directory test-cli ci bench-rg
 
 all: $(TARGET)
 
@@ -93,7 +93,10 @@ test: $(TEST_TARGET)
 test-directory: test_directory
 	./test_directory
 
-ci: all test test-directory
+test-cli: $(TARGET)
+	bash test/test_cli_v3.sh
+
+ci: all test test-directory test-cli
 
 bench-rg: $(TARGET)
 	bash test/benchmark_krep_vs_rg.sh

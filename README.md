@@ -1,14 +1,11 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-2.4.0-blue)
+![Version](https://img.shields.io/badge/version-3.0.0-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
-`krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
+`krep` is an optimized string search utility designed for maximum throughput, low-latency feedback, and modern command-line ergonomics when processing large files and source trees. It combines mmap-based I/O, adaptive algorithms, SIMD acceleration where available, multi-pattern search, recursive traversal controls, JSON Lines output, contextual display, and machine-friendly stats.
 
-> **Note:**  
-> Krep is not intended to be a full replacement or direct competitor to feature-rich tools like `grep` or `ripgrep`. Instead, it aims to be a minimal, efficient, and pragmatic tool focused on speed and simplicity.
->
-> Krep provides the essential features needed for fast searching, without the extensive options and complexity of more comprehensive search utilities. Its design philosophy is to deliver the fastest possible search for the most common use cases, with a clean and minimal interface.
+Version 3.0 moves krep from a minimal fast scanner to a practical daily search CLI: fast by default, scriptable when needed, and comfortable in source trees with globs, exclusions, hidden-file control, `.gitignore` support, file listing modes, and quiet checks.
 
 ## The Story Behind the Name
 
@@ -26,15 +23,27 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 - **Regex support**: POSIX Extended Regular Expression searching
 - **Multiple pattern search**: Efficiently search for multiple patterns simultaneously using Aho-Corasick
 - **Recursive directory search**: Skip binary files and common non-code directories
+- **Modern tree filtering**: Include or exclude paths with repeatable `--glob` and `--exclude`
 - **Gitignore support**: Respect `.gitignore` files during recursive search with `--gitignore`
+- **Hidden path control**: Search hidden files and directories with `--hidden`
 - **Stdin pattern input**: Read patterns from stdin with `-f -` for seamless pipeline integration
+- **Context and line numbers**: `-n`, `-A`, `-B`, and `-C` for grep-compatible surrounding context
+- **JSON Lines output**: `--json` / `--jsonl` for editors, dashboards, and automation
+- **File listing modes**: `-l`, `-L`, and `-q` for fast shell checks and CI workflows
+- **Search stats**: `--stats` emits a compact stderr summary of searched files, skipped paths, bytes, matches, and elapsed time
 - **Colored output**: Highlights matches for better readability
 - **Refined terminal UI**: Clearer colors, improved `-o` line index styling, and a redesigned help screen
 - **Specialized algorithms**: Optimized handling for single-character and short patterns
 - **Match Limiting**: Stop searching a file after a specific number of matching lines are found.
 
-## Recent Improvements
+## What's New in 3.0
 
+- JSON Lines output with structured records for matching lines, only-matching records, counts, and file lists
+- Grep-compatible context controls with `-A`, `-B`, `-C`, plus `-n` line numbering
+- Recursive include/exclude filtering with repeatable `--glob` and `--exclude`
+- `--hidden`, `-l`, `-L`, `-q`, and `--stats` for modern scripting and repository workflows
+- Default recursive target of `.` when using `-r` without an explicit directory
+- CI now includes a CLI integration suite covering the new 3.0 user-facing behavior
 - **Shift-Or / BNDM** bit-parallel search for lightning-fast short pattern matching (2–8 bytes)
 - **Two-Way** string matching (O(n+m) worst-case) as the new default scalar fallback
 - **NEON 32-byte processing** on ARM64/Apple Silicon for doubled throughput
@@ -117,6 +126,37 @@ Search recursively respecting `.gitignore`:
 krep -r --gitignore "TODO" ./project
 ```
 
+Search only C sources while excluding generated/vendor paths:
+
+```bash
+krep -r --gitignore --glob '*.c' --glob '*.h' --exclude '*/vendor/*' "TODO" .
+```
+
+Show line numbers and surrounding context:
+
+```bash
+krep -n -C 2 "panic" app.log
+```
+
+Emit JSON Lines for automation:
+
+```bash
+krep --json -n "needle" ./src/main.c
+```
+
+List files with or without matches:
+
+```bash
+krep -r -l "DeprecatedAPI" .
+krep -r -L "license header" --glob '*.c' .
+```
+
+Run a quiet existence check:
+
+```bash
+krep -q "required_setting" config.ini
+```
+
 Read patterns from stdin (pipe-friendly):
 
 ```bash
@@ -140,17 +180,29 @@ cat krep.c | krep 'c'
 - `-i, --ignore-case` Case-insensitive search
 - `-c, --count` Count matching lines only
 - `-o, --only-matching` Print only the matched parts of lines
+- `-n, --line-number` Prefix matching lines with line numbers
+- `-A NUM, --after-context=NUM` Print NUM lines after each matching line
+- `-B NUM, --before-context=NUM` Print NUM lines before each matching line
+- `-C NUM, --context=NUM` Print NUM lines before and after each matching line
+- `-l, --files-with-matches` Print only file names that contain matches
+- `-L, --files-without-match` Print only file names that do not contain matches
+- `-q, --quiet` Suppress output and use only the exit status
 - `-e PATTERN, --pattern=PATTERN` Specify pattern(s). Can be used multiple times.
 - `-f FILE, --file=FILE` Read patterns from FILE, one per line. Use `-` for stdin.
 - `-m NUM, --max-count=NUM` Stop searching each file after finding NUM matching lines.
 - `-E, --extended-regexp` Use POSIX Extended Regular Expressions
 - `-F, --fixed-strings` Interpret pattern as fixed string(s) (default unless -E is used)
 - `-r, --recursive` Recursively search directories
+- `--glob=GLOB` Include only files matching GLOB. Can be used multiple times.
+- `--exclude=GLOB` Exclude paths matching GLOB. Can be used multiple times.
+- `--hidden` Include hidden files and directories during recursive search
 - `--gitignore` Respect `.gitignore` files during recursive search
 - `--algo=ALGO` Force search algorithm: `auto` (default), `bm` (Boyer-Moore), `kmp` (KMP), `bndm` (Shift-Or), `two` (Two-Way)
 - `-t NUM, --threads=NUM` Use NUM threads for file search (default: auto)
 - `-s STRING, --string=STRING` Search in the provided STRING instead of file(s)
 - `-w, --word-regexp` Match only whole words
+- `--json, --jsonl` Emit JSON Lines output
+- `--stats` Print a compact search summary to stderr
 - `--color[=WHEN]` Control color output ('always', 'never', 'auto')
 - `--no-simd` Explicitly disable SIMD acceleration
 - `-v, --version` Show version information
@@ -179,7 +231,7 @@ make bench-rg
 | `the` | 0.132857 | 0.318571 | 4.848571 | 2.40x | 36.49x |
 | `Sherlock` | 0.031429 | 0.080000 | 2.777143 | 2.55x | 88.36x |
 
-_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 2.4.0 adds BNDM/Shift-Or for 2–8 byte patterns, Two-Way O(n+m) fallback, and 32-byte NEON processing for even higher throughput. Results vary by CPU, storage and cache state._
+_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 3.0.0 keeps the 2.4.0 high-throughput engine and adds modern CLI output, filtering, and automation controls. Results vary by CPU, storage, cache state, compiler, and workload._
 
 ## How Krep Works
 
@@ -233,6 +285,9 @@ When using recursive search (`-r`), Krep automatically:
 - Ignores version control directories (`.git`, `.svn`)
 - Bypasses dependency directories (`node_modules`, `venv`)
 - Detects binary content to avoid searching non-text files
+- Applies repeatable `--glob` include filters and `--exclude` path filters
+- Can include hidden paths with `--hidden`
+- Can emit structured JSON Lines with `--json` for downstream tools
 
 ## Contributing
 

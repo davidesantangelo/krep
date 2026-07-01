@@ -1,3 +1,8 @@
 .vscode/settings.json
 subtitles2016-sample.en
 subtitles2016-sample.en.gz
+krep
+krep_test
+test_directory
+*.o
+test/*.o
