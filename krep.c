@@ -82,7 +82,7 @@ double get_time(void);
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "3.0.0"
+#define VERSION "3.0.1"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -1460,10 +1460,17 @@ size_t print_matching_items(const char *filename, const char *text, size_t text_
                 // Efficiently skip all subsequent matches that start on this *same* line
                 // Find the end of the current line first
                 size_t current_line_end = find_line_end(text, text_len, line_start); // Use text instead of text_start
+                uint64_t i_before = i;
                 while (i < result->count && result->positions[i].start_offset < current_line_end)
                 {
                     i++;
                 }
+
+                // A zero-length match can start exactly at current_line_end. In that case,
+                // the loop above consumes nothing and the outer loop would spin forever.
+                if (i == i_before)
+                    i++;
+
                 continue; // Move to the next potential new line
             }
 

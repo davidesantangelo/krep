@@ -27,6 +27,8 @@ jobs:
         run: make test
       - name: Run Directory Integration Tests
         run: make test-directory
+      - name: Run CLI Integration Tests
+        run: make test-cli
       - name: Ensure ripgrep is available
         if: matrix.os == 'ubuntu-latest'
         shell: bash

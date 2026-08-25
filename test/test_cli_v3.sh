@@ -33,6 +33,38 @@ assert_empty_file() {
   [[ ! -s "${path}" ]] || fail "${label}: expected empty file, got: $(cat "${path}")"
 }
 
+run_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  local timeout_marker="${TMP_DIR}/command-timed-out"
+
+  rm -f "${timeout_marker}"
+  "$@" &
+  local command_pid=$!
+
+  (
+    sleep "${timeout_seconds}"
+    if kill -0 "${command_pid}" 2>/dev/null; then
+      : >"${timeout_marker}"
+      kill -TERM "${command_pid}" 2>/dev/null || true
+      sleep 1
+      kill -KILL "${command_pid}" 2>/dev/null || true
+    fi
+  ) &
+  local watchdog_pid=$!
+  local command_status=0
+
+  wait "${command_pid}" || command_status=$?
+  kill "${watchdog_pid}" 2>/dev/null || true
+  wait "${watchdog_pid}" 2>/dev/null || true
+
+  if [[ -f "${timeout_marker}" ]]; then
+    return 124
+  fi
+
+  return "${command_status}"
+}
+
 mkdir -p "${TMP_DIR}/src" "${TMP_DIR}/vendor" "${TMP_DIR}/.hidden"
 
 cat >"${TMP_DIR}/app.txt" <<'EOF'
@@ -107,5 +139,27 @@ stats_err="${TMP_DIR}/stats.err"
 "${KREP_BIN}" --stats -c needle "${TMP_DIR}/app.txt" >"${stats_out}" 2>"${stats_err}"
 assert_contains "$(cat "${stats_out}")" "${TMP_DIR}/app.txt:2" "--stats keeps normal stdout"
 assert_contains "$(cat "${stats_err}")" "krep stats:" "--stats emits stderr summary"
+
+zero_width_out="${TMP_DIR}/zero-width.out"
+zero_width_err="${TMP_DIR}/zero-width.err"
+zero_width_status=0
+run_with_timeout 3 "${KREP_BIN}" -E '$' "${TMP_DIR}/app.txt" >"${zero_width_out}" 2>"${zero_width_err}" || zero_width_status=$?
+[[ "${zero_width_status}" -ne 124 ]] || fail "zero-width regex at line end timed out"
+[[ "${zero_width_status}" -eq 0 ]] || fail "zero-width regex at line end exited with ${zero_width_status}: $(cat "${zero_width_err}")"
+assert_contains "$(cat "${zero_width_out}")" "${TMP_DIR}/app.txt:alpha" "zero-width regex prints the first line once"
+assert_contains "$(cat "${zero_width_out}")" "${TMP_DIR}/app.txt:delta needle" "zero-width regex reaches the final line"
+
+empty_regex_out="${TMP_DIR}/empty-regex.out"
+empty_regex_err="${TMP_DIR}/empty-regex.err"
+empty_regex_status=0
+run_with_timeout 3 "${KREP_BIN}" -E '' "${TMP_DIR}/app.txt" >"${empty_regex_out}" 2>"${empty_regex_err}" || empty_regex_status=$?
+[[ "${empty_regex_status}" -ne 124 ]] || fail "empty regex timed out"
+if [[ "${empty_regex_status}" -eq 0 ]]; then
+  assert_contains "$(cat "${empty_regex_out}")" "${TMP_DIR}/app.txt:alpha" "empty regex prints matching lines"
+elif [[ "${empty_regex_status}" -eq 2 ]]; then
+  assert_contains "$(cat "${empty_regex_err}")" "Regex compilation error" "platform regex engine rejects empty regex cleanly"
+else
+  fail "empty regex exited with unexpected status ${empty_regex_status}: $(cat "${empty_regex_err}")"
+fi
 
 echo "krep CLI v3 integration tests passed"

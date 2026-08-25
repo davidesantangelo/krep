@@ -28,7 +28,7 @@ jobs:
         run: make -j
 
       - name: Run tests
-        run: make test && make test-directory
+        run: make test && make test-directory && make test-cli
 
       - name: Ensure ripgrep is available
         shell: bash

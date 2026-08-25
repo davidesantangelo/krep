@@ -1,11 +1,16 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-3.0.0-blue)
+![Version](https://img.shields.io/badge/version-3.0.1-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput, low-latency feedback, and modern command-line ergonomics when processing large files and source trees. It combines mmap-based I/O, adaptive algorithms, SIMD acceleration where available, multi-pattern search, recursive traversal controls, JSON Lines output, contextual display, and machine-friendly stats.
 
 Version 3.0 moves krep from a minimal fast scanner to a practical daily search CLI: fast by default, scriptable when needed, and comfortable in source trees with globs, exclusions, hidden-file control, `.gitignore` support, file listing modes, and quiet checks.
+
+## What's New in 3.0.1
+
+- Fixed a busy loop when a zero-width regex match lands exactly at a line ending, including empty regex patterns on platforms that accept them.
+- Added bounded CLI regression coverage for empty and end-of-line zero-width regex patterns on Linux and macOS.
 
 ## The Story Behind the Name
 
