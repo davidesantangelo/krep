@@ -162,4 +162,30 @@ else
   fail "empty regex exited with unexpected status ${empty_regex_status}: $(cat "${empty_regex_err}")"
 fi
 
+# Regression tests for issue #44 heap buffer overflow / over-read fixes
+cat >"${TMP_DIR}/dup_patterns.txt" <<'EOF'
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+EOF
+python3 -c 'print("A" * 64 * 10)' >"${TMP_DIR}/dup_text.txt"
+dup_out="${TMP_DIR}/dup.out"
+run_with_timeout 5 "${KREP_BIN}" -f "${TMP_DIR}/dup_patterns.txt" "${TMP_DIR}/dup_text.txt" >"${dup_out}"
+[[ -s "${dup_out}" ]] || fail "duplicate pattern matching produced empty output"
+
+cat >"${TMP_DIR}/len10_pattern.txt" <<'EOF'
+0123456789
+EOF
+echo "prefix 0123456789 suffix" >"${TMP_DIR}/len10_text.txt"
+len10_out="${TMP_DIR}/len10.out"
+run_with_timeout 3 "${KREP_BIN}" -f "${TMP_DIR}/len10_pattern.txt" "${TMP_DIR}/len10_text.txt" >"${len10_out}"
+assert_contains "$(cat "${len10_out}")" "0123456789" "short pattern loaded from file matches correctly"
+
+mkdir -p "${TMP_DIR}/repo"
+echo "ignored.txt" >"${TMP_DIR}/repo/.gitignore"
+echo "secret" >"${TMP_DIR}/repo/ignored.txt"
+echo "secret" >"${TMP_DIR}/repo/kept.txt"
+gi_out="$("${KREP_BIN}" -r --gitignore secret "${TMP_DIR}/repo")"
+assert_contains "${gi_out}" "kept.txt" "--gitignore keeps non-ignored file"
+assert_not_contains "${gi_out}" "ignored.txt" "--gitignore skips ignored file"
+
 echo "krep CLI v3 integration tests passed"

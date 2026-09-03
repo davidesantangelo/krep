@@ -82,7 +82,7 @@ double get_time(void);
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "3.0.1"
+#define VERSION "3.0.2"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -1046,6 +1046,14 @@ static size_t print_json_matching_items(const char *filename,
     return printable_count;
 }
 
+static inline bool checked_add_size(size_t *value, size_t addend)
+{
+    if (*value > SIZE_MAX - addend)
+        return false;
+    *value += addend;
+    return true;
+}
+
 size_t print_matching_items(const char *filename, const char *text, size_t text_len, const match_result_t *result, const search_params_t *params)
 {
     // Basic validation: No results, no text, or zero matches means nothing to print.
@@ -1134,19 +1142,23 @@ size_t print_matching_items(const char *filename, const char *text, size_t text_
                     num_newlines++;
             }
 
-            // Allocate array for newline positions
-            newline_capacity = num_newlines + 1; // +1 for the implicit newline at the end
-            newline_positions = malloc(newline_capacity * sizeof(size_t));
-
-            // Populate the array if allocation succeeded
-            if (newline_positions)
+            // This cache is optional: use the existing incremental fallback
+            // when its size cannot be represented.
+            if (num_newlines <= (SIZE_MAX / sizeof(*newline_positions)) - 1)
             {
-                size_t idx = 0;
-                for (size_t i = 0; i < text_len; i++)
+                newline_capacity = num_newlines + 1; // +1 for the implicit newline at the end
+                newline_positions = malloc(newline_capacity * sizeof(*newline_positions));
+
+                // Populate the array if allocation succeeded
+                if (newline_positions)
                 {
-                    if (text[i] == '\n')
+                    size_t idx = 0;
+                    for (size_t i = 0; i < text_len; i++)
                     {
-                        newline_positions[idx++] = i;
+                        if (text[i] == '\n')
+                        {
+                            newline_positions[idx++] = i;
+                        }
                     }
                 }
             }
@@ -1521,17 +1533,42 @@ size_t print_matching_items(const char *filename, const char *text, size_t text_
             }
 
             // --- Pre-calculate required buffer size for the line ---
-            size_t line_len = line_end - line_start;
-            size_t max_required_size = filename_prefix_len + line_len + 1; // Prefix + content + newline
-            if (color_output_enabled)
+            size_t max_required_size = filename_prefix_len;
+            size_t simulated_current_pos = line_start;
+            bool size_overflow = !checked_add_size(&max_required_size, 1);
+            if (color_output_enabled && filename_prefix_len == 0)
+                size_overflow |= !checked_add_size(&max_required_size, len_color_text);
+
+            for (size_t k = 0; k < line_match_count && !size_overflow; ++k)
             {
-                // Add space for color codes:
-                // - Initial text color (if no prefix)
-                // - Match color + text color for each match
-                // - Final reset color
-                max_required_size += (filename_prefix_len == 0 ? len_color_text : 0) +
-                                     (line_match_count * (len_color_match + len_color_text)) +
-                                     len_color_reset;
+                size_t k_start = line_match_positions[k].start_offset;
+                size_t k_end = line_match_positions[k].end_offset;
+                if (k_start < line_start)
+                    k_start = line_start;
+                if (k_end > line_end)
+                    k_end = line_end;
+                if (k_start >= k_end)
+                    continue;
+                if (k_start > simulated_current_pos)
+                    size_overflow |= !checked_add_size(&max_required_size,
+                                                       k_start - simulated_current_pos);
+                if (color_output_enabled)
+                    size_overflow |= !checked_add_size(&max_required_size, len_color_match);
+                size_overflow |= !checked_add_size(&max_required_size, k_end - k_start);
+                if (color_output_enabled)
+                    size_overflow |= !checked_add_size(&max_required_size, len_color_text);
+                simulated_current_pos = k_end;
+            }
+            if (!size_overflow && simulated_current_pos < line_end)
+                size_overflow |= !checked_add_size(&max_required_size,
+                                                   line_end - simulated_current_pos);
+            if (!size_overflow && color_output_enabled)
+                size_overflow |= !checked_add_size(&max_required_size, len_color_reset);
+            if (size_overflow)
+            {
+                fprintf(stderr, "Error: Formatted line is too large to represent.\n");
+                i = line_match_scan_idx;
+                continue;
             }
 
             // --- Ensure line buffer capacity once ---
@@ -3390,7 +3427,13 @@ int search_file(const search_params_t *params, const char *filename, int request
         close(fd);
         return 2;
     }
-    file_size = file_stat.st_size;
+    if (file_stat.st_size < 0 || (uintmax_t)file_stat.st_size >= (uintmax_t)SIZE_MAX)
+    {
+        fprintf(stderr, "krep: %s: file is too large to process safely\n", filename);
+        close(fd);
+        return 2;
+    }
+    file_size = (size_t)file_stat.st_size;
 
     // --- Handle Empty File ---
     if (file_size == 0)
@@ -4309,12 +4352,17 @@ static void gitignore_add_pattern(gitignore_t *gi, const char *line)
     // Grow array if needed
     if (gi->count >= gi->capacity)
     {
-        gi->capacity *= 2;
+        if (gi->capacity > SIZE_MAX / 2)
+            return;
+        size_t new_capacity = gi->capacity * 2;
+        if (new_capacity > SIZE_MAX / sizeof(*gi->entries))
+            return;
         gitignore_pattern_t *new_entries = realloc(gi->entries,
-                                                   gi->capacity * sizeof(gitignore_pattern_t));
+                                                   new_capacity * sizeof(*gi->entries));
         if (!new_entries)
             return; // Skip on allocation failure
         gi->entries = new_entries;
+        gi->capacity = new_capacity;
     }
 
     // Remove leading slash (anchored to directory root)
@@ -5932,8 +5980,18 @@ uint64_t simd_sse42_search(const search_params_t *params,
     size_t max_count = params->max_count;
     size_t last_counted_line_start = SIZE_MAX;
 
-    // Load the pattern into an XMM register
-    __m128i pattern_vec = _mm_loadu_si128((const __m128i *)pattern);
+    // Avoid reading beyond a short pattern's strlen()+1 allocation.
+    __m128i pattern_vec;
+    if (pattern_len < sizeof(pattern_vec))
+    {
+        char safe_pattern[sizeof(pattern_vec)] = {0};
+        memcpy(safe_pattern, pattern, pattern_len);
+        pattern_vec = _mm_loadu_si128((const __m128i *)safe_pattern);
+    }
+    else
+    {
+        pattern_vec = _mm_loadu_si128((const __m128i *)pattern);
+    }
 
     const char *current_pos = text_start;
     size_t remaining_len = text_len;

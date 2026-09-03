@@ -1596,6 +1596,20 @@ void test_edge_cases_advanced(void)
                 "KMP handles text shorter than pattern");
 
     cleanup_params(&boundary_params);
+
+    // --- Test print_matching_items buffer sizing with duplicate matches ---
+    printf("\n--- Testing Duplicate Match Handling in print_matching_items ---\n");
+    {
+        match_result_t *dup_result = match_result_init(4);
+        match_result_add(dup_result, 0, 5);
+        match_result_add(dup_result, 0, 5); // duplicate span
+        search_params_t p = create_literal_params("hello", true, false, false);
+        const char *t = "hello world\n";
+        size_t printed = print_matching_items(NULL, t, strlen(t), dup_result, &p);
+        TEST_ASSERT(printed > 0, "print_matching_items safely formats duplicate matches");
+        match_result_free(dup_result);
+        cleanup_params(&p);
+    }
 }
 
 /* ========================================================================= */

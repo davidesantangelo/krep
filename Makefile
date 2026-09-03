@@ -1,6 +1,6 @@
 # krep - A high-performance string search utility
 # Author: Davide Santangelo
-# Version: 3.0.1
+# Version: 3.0.2
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin

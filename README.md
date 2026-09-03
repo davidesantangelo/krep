@@ -1,11 +1,20 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-3.0.1-blue)
+![Version](https://img.shields.io/badge/version-3.0.2-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput, low-latency feedback, and modern command-line ergonomics when processing large files and source trees. It combines mmap-based I/O, adaptive algorithms, SIMD acceleration where available, multi-pattern search, recursive traversal controls, JSON Lines output, contextual display, and machine-friendly stats.
 
 Version 3.0 moves krep from a minimal fast scanner to a practical daily search CLI: fast by default, scriptable when needed, and comfortable in source trees with globs, exclusions, hidden-file control, `.gitignore` support, file listing modes, and quiet checks.
+
+## What's New in 3.0.2
+
+- Fixed 5 heap overflow/over-read security vulnerabilities reported in issue #44:
+  - Fixed heap buffer overflow in `print_matching_items` newline-position cache arithmetic wraparound on 32-bit systems.
+  - Fixed heap buffer overflow in `print_matching_items` trailing newline write when handling duplicate or overlapping multi-pattern matches.
+  - Fixed heap buffer overflow in `search_file` read loop by safely validating signed `fstat` file sizes before buffer allocation.
+  - Fixed heap buffer overflow in `gitignore_add_pattern` after allocation failures by updating array capacity only after successful `realloc`.
+  - Fixed heap buffer over-read in `simd_sse42_search` for literal patterns shorter than 16 bytes by reading through a safe bounded buffer.
 
 ## What's New in 3.0.1
 
